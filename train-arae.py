@@ -48,80 +48,109 @@ class CustomDataset(Dataset):
         label = self.labels[idx]
         cls_token = CLASS_A_TOKEN if label == 0 else CLASS_B_TOKEN
 
-        # A function to truncate tokens to a specific max_length while keeping special tokens
-        def truncate_tokens(
-            tokens: List[int], max_length: int, num_special_tokens: int
+        # Helper function to truncate token IDs and create attention mask
+        def truncate_and_pad(token_ids: List[int], max_length: int, pad_token_id: int):
+            attention_mask = [1] * len(token_ids)
+
+            if len(token_ids) > max_length:
+                # Truncate the token_ids and attention mask to max_length
+                token_ids = token_ids[:max_length]
+                attention_mask = attention_mask[:max_length]
+            else:
+                # Pad token_ids and attention mask to max_length
+                padding_length = max_length - len(token_ids)
+                token_ids = token_ids + ([pad_token_id] * padding_length)
+                attention_mask = attention_mask + ([0] * padding_length)
+
+            return token_ids, attention_mask
+
+        # Function to prepare model inputs from token ids directly
+        def prepare_model_inputs(
+            prefix_token_ids: List[int],
+            text_token_ids: List[int],
+            postfix_token_ids: List[int],
+            max_length: int,
+            pad_token_id: int,
         ):
-            if len(tokens) > max_length - num_special_tokens:
-                # Truncate the tokens to max_length minus the space required for special tokens
-                return tokens[: max_length - num_special_tokens]
-            return tokens
-
-        # Tokenize the text to get its tokens
-        text_tokens = self.tokenizer.tokenize(text)
-
-        # Helper to prepare inputs with appropriate truncation
-        def prepare_inputs(prefix: str, text_tokens: List[int], postfix: str = ""):
-            tokens = (
-                self.tokenizer.tokenize(prefix)
-                + truncate_tokens(
-                    text_tokens,
-                    self.max_length,
-                    len(self.tokenizer.tokenize(prefix + postfix)),
-                )
-                + self.tokenizer.tokenize(postfix)
+            sequence_token_ids = prefix_token_ids + text_token_ids + postfix_token_ids
+            truncated_token_ids, attention_mask = truncate_and_pad(
+                sequence_token_ids, max_length, pad_token_id
             )
-            return self.tokenizer.convert_tokens_to_string(tokens)
+
+            # Convert lists to PyTorch tensors
+            input_ids = torch.tensor([truncated_token_ids], dtype=torch.long)
+            attention_mask = torch.tensor([attention_mask], dtype=torch.long)
+
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+        # Token IDs for special tokens, placeholders, and padding
+        pad_token_id = self.tokenizer.pad_token_id
+        cls_token_id = self.tokenizer.convert_tokens_to_ids(cls_token)
+        task_clm_token_id = self.tokenizer.convert_tokens_to_ids(TASK_CLM_TOKEN)
+        task_encoding_token_id = self.tokenizer.convert_tokens_to_ids(
+            TASK_ENCODING_TOKEN
+        )
+        task_decoding_token_id = self.tokenizer.convert_tokens_to_ids(
+            TASK_DECODING_TOKEN
+        )
+        task_classification_token_id = self.tokenizer.convert_tokens_to_ids(
+            TASK_CLASSIFICATION_TOKEN
+        )
+        embedding_placeholder_token_id = self.tokenizer.convert_tokens_to_ids(
+            EMBEDDING_PLACEHOLDER_TOKEN
+        )
+        score_placeholder_token_id = self.tokenizer.convert_tokens_to_ids(
+            SCORE_PLACEHOLDER_TOKEN
+        )
+
+        # Tokenize the text into token IDs
+        text_token_ids = self.tokenizer(
+            text, add_special_tokens=False
+        ).input_ids  # Don't add special tokens
 
         # Tokenize CLM task
-        clm_text = prepare_inputs(TASK_CLM_TOKEN, text_tokens)
-        clm_inputs = self.tokenizer(
-            clm_text,
-            return_tensors="pt",
-            max_length=self.max_length,
-            truncation=True,
-            padding="max_length",
+        clm_inputs = prepare_model_inputs(
+            [task_clm_token_id], text_token_ids, [], self.max_length, pad_token_id
         )
 
         # Tokenize encoding task
-        enc_text = prepare_inputs(
-            TASK_ENCODING_TOKEN + cls_token, text_tokens, EMBEDDING_PLACEHOLDER_TOKEN
-        )
-        enc_inputs = self.tokenizer(
-            enc_text,
-            return_tensors="pt",
-            max_length=self.max_length,
-            truncation=True,
-            padding="max_length",
+        enc_inputs = prepare_model_inputs(
+            [task_encoding_token_id, cls_token_id],
+            text_token_ids,
+            [embedding_placeholder_token_id],
+            self.max_length,
+            pad_token_id,
         )
 
         # Tokenize decoding task
-        dec_text = prepare_inputs(
-            TASK_DECODING_TOKEN + cls_token + EMBEDDING_PLACEHOLDER_TOKEN, text_tokens
-        )
-        dec_inputs = self.tokenizer(
-            dec_text,
-            return_tensors="pt",
-            max_length=self.max_length,
-            truncation=True,
-            padding="max_length",
+        dec_inputs = prepare_model_inputs(
+            [task_decoding_token_id, cls_token_id, embedding_placeholder_token_id],
+            text_token_ids,
+            [],
+            self.max_length,
+            pad_token_id,
         )
 
-        # For the classification task, we don't have a variable length text input so we can tokenize it directly
-        cls_inputs = self.tokenizer(
-            f"{TASK_CLASSIFICATION_TOKEN}{EMBEDDING_PLACEHOLDER_TOKEN}{SCORE_PLACEHOLDER_TOKEN}",
-            return_tensors="pt",
-            max_length=self.max_length,
-            truncation=True,
-            padding="max_length",
+        # Tokenize classification task (no need to handle text, just tokens)
+        cls_inputs = prepare_model_inputs(
+            [
+                task_classification_token_id,
+                embedding_placeholder_token_id,
+                score_placeholder_token_id,
+            ],
+            [],
+            [],
+            self.max_length,
+            pad_token_id,
         )
 
+        # Now you have clm_inputs, enc_inputs, dec_inputs, and cls_inputs dictionaries with 'input_ids' and 'attention_mask' as keys
         return {
             "clm_inputs": clm_inputs,
             "enc_inputs": enc_inputs,
             "dec_inputs": dec_inputs,
             "cls_inputs": cls_inputs,
-            "cls_token": cls_token,
+            "cls_token_id": cls_token_id,
         }
 
 
@@ -137,7 +166,7 @@ class MyDataCollator:
 
 
 # Custom loss functions
-def clm_loss_fn(outputs, labels):
+def clm_loss_fn(outputs, labels) -> torch.Tensor:
     loss_fct = CrossEntropyLoss()
     lm_logits = outputs.logits
 
@@ -180,12 +209,11 @@ def classification_loss_fn(model_output, dataset_labels):
 
 class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
-        input_token_ids = inputs.pop("input_ids")
-        input_class_labels = inputs.pop("input_labels")
-
         # Causal language modelling loss
-        clm_outputs = model(input_ids=input_token_ids)
-        clm_loss = clm_loss_fn(clm_outputs, input_token_ids)
+        clm_inputs = inputs.pop("clm_inputs")
+
+        clm_outputs = model(**clm_inputs)
+        clm_loss = clm_loss_fn(clm_outputs, clm_inputs.input_ids)
 
         # Autoencoder loss
 
