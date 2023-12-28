@@ -8,16 +8,21 @@
 # If that works, this might result in a powerful supervision technique, or more
 
 import random
-from typing import List
+from typing import Any, Dict, List, Optional, TypedDict
 
 import numpy as np
+import optree
 import torch
+import torch.nn.functional as F
+from einops import rearrange
+from jaxtyping import Bool, Float, Int, Int64
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorForLanguageModeling,
+    PreTrainedModel,
     PreTrainedTokenizerBase,
     Trainer,
     TrainingArguments,
@@ -49,18 +54,13 @@ class CustomDataset(Dataset):
         cls_token = CLASS_A_TOKEN if label == 0 else CLASS_B_TOKEN
 
         # Helper function to truncate token IDs and create attention mask
-        def truncate_and_pad(token_ids: List[int], max_length: int, pad_token_id: int):
+        def pad_tokens(token_ids: List[int], max_length: int, pad_token_id: int):
             attention_mask = [1] * len(token_ids)
 
-            if len(token_ids) > max_length:
-                # Truncate the token_ids and attention mask to max_length
-                token_ids = token_ids[:max_length]
-                attention_mask = attention_mask[:max_length]
-            else:
-                # Pad token_ids and attention mask to max_length
-                padding_length = max_length - len(token_ids)
-                token_ids = token_ids + ([pad_token_id] * padding_length)
-                attention_mask = attention_mask + ([0] * padding_length)
+            # Pad token_ids and attention mask to max_length
+            padding_length = max_length - len(token_ids)
+            token_ids = token_ids + ([pad_token_id] * padding_length)
+            attention_mask = attention_mask + ([0] * padding_length)
 
             return token_ids, attention_mask
 
@@ -72,19 +72,31 @@ class CustomDataset(Dataset):
             max_length: int,
             pad_token_id: int,
         ):
+            special_length = len(prefix_token_ids) + len(postfix_token_ids)
+            text_max_length = max_length - special_length
+
+            text_token_ids = text_token_ids[:text_max_length]
             sequence_token_ids = prefix_token_ids + text_token_ids + postfix_token_ids
-            truncated_token_ids, attention_mask = truncate_and_pad(
+            assert len(sequence_token_ids) <= max_length, "Token sequence too long!"
+
+            token_ids, attention_mask = pad_tokens(
                 sequence_token_ids, max_length, pad_token_id
             )
 
+            assert len(token_ids) == max_length, "Length mismatch"
+            assert len(attention_mask) == max_length, "Length mismatch"
+
             # Convert lists to PyTorch tensors
-            input_ids = torch.tensor([truncated_token_ids], dtype=torch.long)
-            attention_mask = torch.tensor([attention_mask], dtype=torch.long)
+            input_ids = torch.tensor(token_ids, dtype=torch.long)
+            attention_mask = torch.tensor(attention_mask, dtype=torch.long)
 
             return {"input_ids": input_ids, "attention_mask": attention_mask}
 
         # Token IDs for special tokens, placeholders, and padding
         pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
         cls_token_id = self.tokenizer.convert_tokens_to_ids(cls_token)
         task_clm_token_id = self.tokenizer.convert_tokens_to_ids(TASK_CLM_TOKEN)
         task_encoding_token_id = self.tokenizer.convert_tokens_to_ids(
@@ -145,37 +157,65 @@ class CustomDataset(Dataset):
         )
 
         # Now you have clm_inputs, enc_inputs, dec_inputs, and cls_inputs dictionaries with 'input_ids' and 'attention_mask' as keys
+
+        # Get indices of special tokens for replacement
+        # enc_emb_pos = enc_inputs.input_ids
+
         return {
             "clm_inputs": clm_inputs,
             "enc_inputs": enc_inputs,
             "dec_inputs": dec_inputs,
             "cls_inputs": cls_inputs,
+            "cls_id": label,
             "cls_token_id": cls_token_id,
         }
 
 
 # Define a custom collator
-class MyDataCollator:
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
+class PyTreeCollator:
+    """Collated leaves of a list of PyTrees with identical structure into batches"""
 
-    def collate_batch(self, batch):
-        # Implement the collation logic considering the complex objectives
-        # and multiple task tokens
-        pass
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        def map_fn(x: Any, *xs: Any) -> Any:
+            if isinstance(x, torch.Tensor):
+                y = torch.stack((x,) + xs, dim=0)
+            elif isinstance(x, np.ndarray):
+                y = np.stack((x,) + xs, axis=0)
+                y = torch.from_numpy(y)
+            elif isinstance(x, (float, int, bool)):
+                y = np.asarray((x,) + xs)
+                y = torch.from_numpy(y)
+            else:
+                raise TypeError(x)
+
+            return y
+
+        return optree.tree_map(map_fn, features[0], *features[1:])
 
 
 # Custom loss functions
-def clm_loss_fn(outputs, labels) -> torch.Tensor:
-    loss_fct = CrossEntropyLoss()
-    lm_logits = outputs.logits
-
+def clm_loss_fn(
+    logits: Float[torch.Tensor, "batch sequence features"],
+    labels: Int64[torch.Tensor, "batch sequence"],
+    mask: Optional[Bool[torch.Tensor, "batch sequence"]] = None,
+) -> Float[torch.Tensor, ""]:
     # Shift so that tokens < n predict n
-    shift_logits = lm_logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
+    logits = logits[..., :-1, :].contiguous()
+    labels = labels[..., 1:].contiguous()
 
     # Flatten the tokens
-    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    logits = rearrange(logits, "b s f -> (b s) f")
+    labels = rearrange(labels, "b s -> (b s)")
+
+    # Calculate next-token loss
+    if mask is None:
+        loss = F.cross_entropy(logits, labels, reduction="mean")
+    else:
+        loss = F.cross_entropy(logits, labels, reduction="none")
+        mask = mask[..., :-1].contiguous()
+        mask = rearrange(mask, "b s -> (b s)")
+        loss = torch.mean(loss[mask])
+
     return loss
 
 
@@ -207,48 +247,237 @@ def classification_loss_fn(model_output, dataset_labels):
     return loss
 
 
+class LMInputs(TypedDict):
+    input_ids: Int64[torch.Tensor, "batch sequence"]
+    attention_mask: Int64[torch.Tensor, "batch sequence"]
+
+
+class Batch(TypedDict):
+    clm_inputs: LMInputs
+    enc_inputs: LMInputs
+    dec_inputs: LMInputs
+    cls_inputs: LMInputs
+    cls_id: Int64[torch.Tensor, "batch"]
+    cls_token_id: Int64[torch.Tensor, "batch"]
+
+
 class CustomTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(
+        self,
+        model: PreTrainedModel,
+        inputs: Batch,
+        return_outputs: bool = False,
+    ):
+        """
+        def find_token_pos(
+            token_ids: torch.LongTensor, target_id: int
+        ) -> torch.LongTensor:
+            _, token_pos = torch.where(token_ids == target_id)
+            return token_pos
+
+        def gather_1d(
+            input: torch.Tensor, dim: int, index: torch.LongTensor
+        ) -> torch.Tensor:
+            shape = input.shape
+            shape[dim] = 1
+
+            return torch.gather(input, dim, index.broadcast_to(shape))
+        """
+
+        def gather_from_tokens(
+            key: Int64[torch.Tensor, "batch sequence"],
+            values: Float[torch.Tensor, "batch sequence features"],
+            query: int,
+        ) -> Float[torch.Tensor, "batch features"]:
+            batch, sequence, features = values.shape
+
+            _, index = torch.where(key == query)
+            assert index.shape[0] == values.shape[0], "Matched multiple tokens"
+
+            # With gather (untested)
+            # """
+            index = index.reshape(batch, 1, 1)
+            index = index.expand(batch, 1, features)
+            out = torch.gather(values, 1, index)
+            out = out.reshape(batch, features)
+            # """
+
+            # With indexing (untested)
+            """
+            out = values[:, pos]
+            """
+
+            # With select (1d gather / indexing)
+            # out = torch.select(values, 1, index)
+
+            return out
+
+        def scatter_to_tokens(
+            key: Int64[torch.Tensor, "batch sequence"],
+            source: Float[torch.Tensor, "batch features"],
+            values: Float[torch.Tensor, "batch sequence features"],
+            query: int,
+        ) -> Float[torch.Tensor, "batch sequence features"]:
+            batch, sequence, features = values.shape
+
+            _, index = torch.where(key == query)
+            assert index.shape[0] == values.shape[0], "Matched multiple tokens"
+
+            # With scatter (untested)
+            # """
+            index = index.reshape(batch, 1, 1)
+            index = index.expand(batch, 1, features)
+            source = source.reshape(batch, 1, features)
+            out = torch.scatter(values, 1, index, source)
+            # """
+
+            # With select_scatter (1d scatter / indexing)
+            # out = torch.select_scatter(values, source, 1, index)
+
+            return out
+
+        def get_cls_loss(
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            cls_ids: torch.Tensor,
+            embeddings: Float[torch.Tensor, "batch features"],
+        ) -> Float[torch.Tensor, ""]:
+            input_embeddings = model.get_input_embeddings()(input_ids)
+            input_embeddings = scatter_to_tokens(
+                key=input_ids,
+                source=embeddings,
+                values=input_embeddings,
+                query=embedding_placeholder_token_id,
+            )
+
+            outputs = model(
+                inputs_embeds=input_embeddings,
+                attention_mask=attention_mask,
+            )
+
+            logits = gather_from_tokens(
+                key=input_ids,
+                values=outputs["logits"],
+                query=score_placeholder_token_id,
+            )
+            logits = logits[:, [cls_a_token_id, cls_b_token_id]]
+            loss = F.cross_entropy(logits, cls_ids)
+
+            return loss
+
+        # Get token ids
+        embedding_placeholder_token_id = self.tokenizer.convert_tokens_to_ids(
+            EMBEDDING_PLACEHOLDER_TOKEN
+        )
+        score_placeholder_token_id = self.tokenizer.convert_tokens_to_ids(
+            SCORE_PLACEHOLDER_TOKEN
+        )
+
+        cls_a_token_id = self.tokenizer.convert_tokens_to_ids(CLASS_A_TOKEN)
+        cls_b_token_id = self.tokenizer.convert_tokens_to_ids(CLASS_B_TOKEN)
+
         # Causal language modelling loss
         clm_inputs = inputs.pop("clm_inputs")
 
-        clm_outputs = model(**clm_inputs)
-        clm_loss = clm_loss_fn(clm_outputs, clm_inputs.input_ids)
+        clm_outputs = model(
+            input_ids=clm_inputs["input_ids"],
+            attention_mask=clm_inputs["attention_mask"],
+        )
+        clm_loss = clm_loss_fn(
+            logits=clm_outputs["logits"],
+            labels=clm_inputs["input_ids"],
+            mask=clm_inputs["attention_mask"],
+        )
 
         # Autoencoder loss
 
         ## Encode
         enc_inputs = inputs.pop("enc_inputs")
-        enc_outputs = model(**enc_inputs)
+        enc_outputs = model(
+            input_ids=enc_inputs["input_ids"],
+            attention_mask=enc_inputs["attention_mask"],
+            output_hidden_states=True,
+        )
 
-        emb_token_idx = inputs.pop("emb_token_idx")
-        enc_emb_values = torch.gather(inputs=enc_outputs, dim=1, index=emb_token_idx)
+        enc_embeddings = gather_from_tokens(
+            key=enc_inputs["input_ids"],
+            values=enc_outputs["hidden_states"][-1],
+            query=embedding_placeholder_token_id,
+        )
 
         ## Decode
-        # dec_task_token_id = self.tokenizer.convert_tokens_to_ids(TASK_DECODING_TOKEN)
 
         ### Construct decoding input
         dec_inputs = inputs.pop("dec_inputs")
-        dec_input_ids = dec_inputs.input_ids
-        dec_input_embeddings = model.embedding(dec_input_ids)
+
+        dec_input_embeddings = model.get_input_embeddings()(dec_inputs["input_ids"])
+        dec_input_embeddings = scatter_to_tokens(
+            key=dec_inputs["input_ids"],
+            source=enc_embeddings,
+            values=dec_input_embeddings,
+            query=embedding_placeholder_token_id,
+        )
 
         ## Loss
+        dec_outputs = model(
+            inputs_embeds=dec_input_embeddings,
+            attention_mask=dec_inputs["attention_mask"],
+        )
+
+        ae_loss = clm_loss_fn(
+            logits=dec_outputs["logits"],
+            labels=dec_inputs["input_ids"],
+            mask=dec_inputs["attention_mask"],
+        )
 
         # Matching loss
+        cls_inputs = inputs.pop("cls_inputs")
+
+        model.requires_grad_(False)
+        adv_loss = get_cls_loss(
+            input_ids=cls_inputs["input_ids"],
+            attention_mask=cls_inputs["attention_mask"],
+            cls_ids=1 - inputs["cls_id"],
+            embeddings=enc_embeddings,
+        )
+        model.requires_grad_(True)
 
         # Classification loss
+        cls_loss = get_cls_loss(
+            input_ids=cls_inputs["input_ids"],
+            attention_mask=cls_inputs["attention_mask"],
+            cls_ids=inputs["cls_id"],
+            embeddings=enc_embeddings.detach(),
+        )
+
+        self.log_metrics(
+            split="train",
+            metrics={
+                "clm_loss": clm_loss,
+                "ae_loss": ae_loss,
+                "adv_loss": adv_loss,
+                "cls_loss": cls_loss,
+            },
+        )
+
+        return clm_loss + ae_loss + adv_loss + cls_loss
 
 
 if __name__ == "__main__":
     # model_name = "tiiuae/falcon-rw-1b"
     model_name = "EleutherAI/gpt-neo-125m"
-    file_A = "path_to_dataset_A.txt"
-    file_B = "path_to_dataset_B.txt"
-    max_length = 128
+    file_A = "data/eng_wikipedia_2016_1M-sentences.txt"
+    file_B = "data/deu_wikipedia_2016_1M-sentences.txt"
+    max_length = 64
 
     # Load model
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, device_map="auto", torch_dtype="auto"
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    print(model.hf_device_map, model.dtype)
+    print(tokenizer("ABC"))
 
     # Modify to include extra tokens
     TASK_CLM_TOKEN = "<|CLM-TASK|>"
@@ -278,29 +507,34 @@ if __name__ == "__main__":
 
     model.resize_token_embeddings(len(tokenizer))
 
+    print(tokenizer(f"{TASK_ENCODING_TOKEN}{CLASS_A_TOKEN}ABC"))
+
     # Make dataset
     dataset = CustomDataset(tokenizer, file_A, file_B, max_length)
-    data_collator = MyDataCollator(tokenizer)
+    print(dataset[0])
+    print(dataset[-1])
+
+    data_collator = PyTreeCollator()
 
     # Define training arguments
     training_args = TrainingArguments(
         output_dir="./results",
         num_train_epochs=3,
-        per_device_train_batch_size=8,
+        per_device_train_batch_size=2,
         warmup_steps=500,
         weight_decay=0.01,
         logging_dir="./logs",
         logging_steps=10,
+        remove_unused_columns=False,
     )
 
     # Trainer
     trainer = CustomTrainer(
         model=model,
         args=training_args,
-        data_collator=data_collator.collate_batch,
+        data_collator=data_collator,
         train_dataset=dataset,
         tokenizer=tokenizer,
-        compute_loss=None,  # Define your custom loss function logic in the Trainer instead
     )
 
     # Start training
