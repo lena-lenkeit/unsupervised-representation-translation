@@ -2,9 +2,48 @@ from typing import List, NamedTuple
 
 import numpy as np
 from jaxtyping import Int64
-from tokens import ARAETokens
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
+
+from arae.tokens import ARAETokens
+
+
+# Helper function to truncate token IDs and create attention mask
+def pad_tokens(token_ids: List[int], max_length: int, pad_token_id: int):
+    attention_mask = [1] * len(token_ids)
+
+    # Pad token_ids and attention mask to max_length
+    padding_length = max_length - len(token_ids)
+    token_ids = token_ids + ([pad_token_id] * padding_length)
+    attention_mask = attention_mask + ([0] * padding_length)
+
+    return token_ids, attention_mask
+
+
+# Function to prepare model inputs from token ids directly
+def prepare_model_inputs(
+    prefix_token_ids: List[int],
+    text_token_ids: List[int],
+    postfix_token_ids: List[int],
+    max_length: int,
+    pad_token_id: int,
+):
+    special_length = len(prefix_token_ids) + len(postfix_token_ids)
+    text_max_length = max_length - special_length
+
+    text_token_ids = text_token_ids[:text_max_length]
+    sequence_token_ids = prefix_token_ids + text_token_ids + postfix_token_ids
+    assert len(sequence_token_ids) <= max_length, "Token sequence too long!"
+
+    token_ids, attention_mask = pad_tokens(sequence_token_ids, max_length, pad_token_id)
+
+    assert len(token_ids) == max_length, "Length mismatch"
+    assert len(attention_mask) == max_length, "Length mismatch"
+
+    token_ids = np.asarray(token_ids, dtype=np.int64)
+    attention_mask = np.asarray(attention_mask, dtype=np.int64)
+
+    return SingleTaskData(input_ids=token_ids, attention_mask=attention_mask)
 
 
 class SingleTaskData(NamedTuple):
@@ -50,44 +89,6 @@ class ARAEDataset(Dataset):
         text = self.dataset[idx]
         label = self.labels[idx]
         cls_token_id = self.tokens.label.a.id if label == 0 else self.tokens.label.b.id
-
-        # Helper function to truncate token IDs and create attention mask
-        def pad_tokens(token_ids: List[int], max_length: int, pad_token_id: int):
-            attention_mask = [1] * len(token_ids)
-
-            # Pad token_ids and attention mask to max_length
-            padding_length = max_length - len(token_ids)
-            token_ids = token_ids + ([pad_token_id] * padding_length)
-            attention_mask = attention_mask + ([0] * padding_length)
-
-            return token_ids, attention_mask
-
-        # Function to prepare model inputs from token ids directly
-        def prepare_model_inputs(
-            prefix_token_ids: List[int],
-            text_token_ids: List[int],
-            postfix_token_ids: List[int],
-            max_length: int,
-            pad_token_id: int,
-        ):
-            special_length = len(prefix_token_ids) + len(postfix_token_ids)
-            text_max_length = max_length - special_length
-
-            text_token_ids = text_token_ids[:text_max_length]
-            sequence_token_ids = prefix_token_ids + text_token_ids + postfix_token_ids
-            assert len(sequence_token_ids) <= max_length, "Token sequence too long!"
-
-            token_ids, attention_mask = pad_tokens(
-                sequence_token_ids, max_length, pad_token_id
-            )
-
-            assert len(token_ids) == max_length, "Length mismatch"
-            assert len(attention_mask) == max_length, "Length mismatch"
-
-            token_ids = np.asarray(token_ids, dtype=np.int64)
-            attention_mask = np.asarray(attention_mask, dtype=np.int64)
-
-            return SingleTaskData(input_ids=token_ids, attention_mask=attention_mask)
 
         # Token IDs for special tokens, placeholders, and padding
         pad_token_id = self.tokenizer.pad_token_id

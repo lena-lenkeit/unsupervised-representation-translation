@@ -24,6 +24,8 @@ from arae.trainers import ARAETrainer
 from arae.utils import add_tokens_to_model
 
 if __name__ == "__main__":
+    # Hyperparameters
+
     # model_name = "tiiuae/falcon-rw-1b"
     model_name = "EleutherAI/gpt-neo-125m"
     file_A = "data/eng_wikipedia_2016_1M-sentences.txt"

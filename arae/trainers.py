@@ -1,6 +1,5 @@
 from typing import NamedTuple, TypedDict
 
-import losses as L
 import torch
 import torch.nn.functional as F
 from jaxtyping import Float, Int64
@@ -8,6 +7,8 @@ from tokens import ARAETokens
 from transformers import PreTrainedModel, Trainer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from utils import gather_from_tokens, scatter_to_tokens
+
+import arae.losses as L
 
 
 def cls_loss_fn(
