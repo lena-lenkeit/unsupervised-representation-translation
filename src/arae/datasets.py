@@ -28,6 +28,7 @@ def prepare_model_inputs(
     postfix_token_ids: List[int],
     max_length: int,
     pad_token_id: int,
+    pad: bool = True,
 ):
     special_length = len(prefix_token_ids) + len(postfix_token_ids)
     text_max_length = max_length - special_length
@@ -36,13 +37,19 @@ def prepare_model_inputs(
     sequence_token_ids = prefix_token_ids + text_token_ids + postfix_token_ids
     assert len(sequence_token_ids) <= max_length, "Token sequence too long!"
 
-    token_ids, attention_mask = pad_tokens(sequence_token_ids, max_length, pad_token_id)
+    if pad:
+        token_ids, attention_mask = pad_tokens(
+            sequence_token_ids, max_length, pad_token_id
+        )
 
-    assert len(token_ids) == max_length, "Length mismatch"
-    assert len(attention_mask) == max_length, "Length mismatch"
+        assert len(token_ids) == max_length, "Length mismatch"
+        assert len(attention_mask) == max_length, "Length mismatch"
 
-    token_ids = np.asarray(token_ids, dtype=np.int64)
-    attention_mask = np.asarray(attention_mask, dtype=np.int64)
+        token_ids = np.asarray(token_ids, dtype=np.int64)
+        attention_mask = np.asarray(attention_mask, dtype=np.int64)
+    else:
+        token_ids = np.asarray(sequence_token_ids, dtype=np.int64)
+        attention_mask = np.ones_like(token_ids)
 
     return ARAETaskData(input_ids=token_ids, attention_mask=attention_mask)
 
@@ -74,10 +81,14 @@ class ARAEDataset(Dataset):
         tokens: ARAETokens,
     ):
         with open(file_A, "r") as f:
-            self.sentences_A = [line.strip() for line in f.readlines()]
+            self.sentences_A = [
+                line.split(maxsplit=1)[-1].strip() for line in f.readlines()
+            ]
 
         with open(file_B, "r") as f:
-            self.sentences_B = [line.strip() for line in f.readlines()]
+            self.sentences_B = [
+                line.split(maxsplit=1)[-1].strip() for line in f.readlines()
+            ]
 
         self.dataset = self.sentences_A + self.sentences_B
         self.labels = [0] * len(self.sentences_A) + [1] * len(self.sentences_B)
