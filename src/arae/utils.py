@@ -1,8 +1,8 @@
-from typing import List
+from typing import List, Union
 
 import torch
 from jaxtyping import Float, Int64
-from transformers import PreTrainedModel, PreTrainedTokenizer
+from transformers import PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from arae.tokens import ARAETokens, LabelTokens, PlaceholderTokens, TaskTokens, Token
 
@@ -45,7 +45,8 @@ def scatter_to_tokens(
 
 
 def add_tokens_to_model(
-    model: PreTrainedModel, tokenizer: PreTrainedTokenizer
+    model: PreTrainedModel,
+    tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
 ) -> ARAETokens:
     # Define token strings
     TASK_CLM_TOKEN = "<|CLM-TASK|>"

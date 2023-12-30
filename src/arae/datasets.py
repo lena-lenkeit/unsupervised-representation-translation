@@ -1,9 +1,9 @@
-from typing import List, NamedTuple
+from typing import List, Union
 
 import numpy as np
 from jaxtyping import Int64
 from torch.utils.data import Dataset
-from transformers import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from arae.tokens import ARAETokens
 
@@ -64,7 +64,7 @@ class SingleInputs(NamedTuple):
 class ARAEDataset(Dataset):
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
         file_A: str,
         file_B: str,
         max_length: int,
