@@ -1,3 +1,4 @@
+from dataclasses import asdict, dataclass
 from typing import List, Union
 
 import numpy as np
@@ -43,19 +44,21 @@ def prepare_model_inputs(
     token_ids = np.asarray(token_ids, dtype=np.int64)
     attention_mask = np.asarray(attention_mask, dtype=np.int64)
 
-    return SingleTaskData(input_ids=token_ids, attention_mask=attention_mask)
+    return ARAETaskData(input_ids=token_ids, attention_mask=attention_mask)
 
 
-class SingleTaskData(NamedTuple):
+@dataclass
+class ARAETaskData:
     input_ids: Int64[np.ndarray, "sequence"]
     attention_mask: Int64[np.ndarray, "sequence"]
 
 
-class SingleInputs(NamedTuple):
-    clm_inputs: SingleTaskData
-    enc_inputs: SingleTaskData
-    dec_inputs: SingleTaskData
-    cls_inputs: SingleTaskData
+@dataclass
+class ARAEInputs:
+    clm: ARAETaskData
+    enc: ARAETaskData
+    dec: ARAETaskData
+    cls: ARAETaskData
     cls_id: Int64[np.ndarray, ""]
     cls_token_id: Int64[np.ndarray, ""]
 
@@ -144,11 +147,13 @@ class ARAEDataset(Dataset):
             pad_token_id,
         )
 
-        return SingleInputs(
-            clm_inputs=clm_inputs,
-            enc_inputs=enc_inputs,
-            dec_inputs=dec_inputs,
-            cls_inputs=cls_inputs,
+        inputs = ARAEInputs(
+            clm=clm_inputs,
+            enc=enc_inputs,
+            dec=dec_inputs,
+            cls=cls_inputs,
             cls_id=np.asarray(label, dtype=np.int64),
             cls_token_id=np.asarray(cls_token_id, dtype=np.int64),
         )
+
+        return asdict(inputs)

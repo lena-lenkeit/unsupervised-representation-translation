@@ -1,14 +1,16 @@
-from typing import NamedTuple, TypedDict
+from dataclasses import dataclass
+from typing import Any, Dict, Mapping, NamedTuple, TypedDict, Union
 
 import torch
 import torch.nn.functional as F
+from dacite import from_dict
 from jaxtyping import Float, Int64
-from tokens import ARAETokens
 from transformers import PreTrainedModel, Trainer
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from utils import gather_from_tokens, scatter_to_tokens
 
 import arae.losses as L
+from arae.tokens import ARAETokens
+from arae.utils import gather_from_tokens, scatter_to_tokens
 
 
 def cls_loss_fn(
@@ -43,16 +45,18 @@ def cls_loss_fn(
     return loss
 
 
-class LMInputs(NamedTuple):
+@dataclass
+class ARAETaskData:
     input_ids: Int64[torch.Tensor, "batch sequence"]
     attention_mask: Int64[torch.Tensor, "batch sequence"]
 
 
-class BatchInputs(NamedTuple):
-    clm: LMInputs
-    enc: LMInputs
-    dec: LMInputs
-    cls: LMInputs
+@dataclass
+class ARAEInputs:
+    clm: ARAETaskData
+    enc: ARAETaskData
+    dec: ARAETaskData
+    cls: ARAETaskData
     cls_id: Int64[torch.Tensor, "batch"]
     cls_token_id: Int64[torch.Tensor, "batch"]
 
@@ -65,9 +69,12 @@ class ARAETrainer(Trainer):
     def compute_loss(
         self,
         model: PreTrainedModel,
-        inputs: BatchInputs,
+        inputs: Dict[str, Any],
         return_outputs: bool = False,
     ):
+        inputs = from_dict(data_class=ARAEInputs, data=inputs)  # type: ignore
+        assert isinstance(inputs, ARAEInputs)
+
         # Causal language modelling loss
         clm_outputs = model(
             input_ids=inputs.clm.input_ids,
