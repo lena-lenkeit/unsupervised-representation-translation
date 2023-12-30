@@ -26,7 +26,7 @@ def clm_loss_fn(
         loss = F.cross_entropy(logits, labels, reduction="mean")
     else:
         loss = F.cross_entropy(logits, labels, reduction="none")
-        mask = mask[..., :-1].contiguous()
+        mask = mask[..., 1:].contiguous()
         mask = rearrange(mask, "b s -> (b s)")
         loss = torch.mean(loss[mask])
 
