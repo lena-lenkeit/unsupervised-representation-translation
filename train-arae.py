@@ -39,7 +39,6 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     assert isinstance(model, PreTrainedModel)
-    assert isinstance(tokenizer, PreTrainedTokenizer)
 
     # Modify to include extra tokens
     tokens = add_tokens_to_model(model, tokenizer)
@@ -51,13 +50,15 @@ if __name__ == "__main__":
     # Define training arguments
     training_args = TrainingArguments(
         output_dir="./results",
-        num_train_epochs=3,
-        per_device_train_batch_size=2,
-        warmup_steps=500,
-        weight_decay=0.01,
+        num_train_epochs=1,
+        per_device_train_batch_size=4,
+        warmup_steps=0,
+        weight_decay=0.0,
         logging_dir="./logs",
         logging_steps=10,
         remove_unused_columns=False,
+        save_total_limit=1,
+        learning_rate=1e-5,
     )
 
     # Trainer
@@ -71,4 +72,5 @@ if __name__ == "__main__":
     )
 
     # Start training
+    # trainer.train(resume_from_checkpoint="results/checkpoint-5000")
     trainer.train()

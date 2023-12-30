@@ -10,6 +10,7 @@
 from typing import Any, Dict, List, Optional, TypedDict
 
 import torch
+from dacite import from_dict
 from torch.distributions import Categorical
 from transformers import (
     AutoModelForCausalLM,
@@ -21,19 +22,24 @@ from transformers import (
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from arae.collators import PyTreeCollator
-from arae.datasets import ARAEDataset, prepare_model_inputs
+from arae.datasets import ARAEDataset, ARAEInputs, prepare_model_inputs
 from arae.tokens import ARAETokens, LabelTokens, PlaceholderTokens, TaskTokens, Token
 from arae.trainers import ARAETrainer
 from arae.utils import add_tokens_to_model, gather_from_tokens, scatter_to_tokens
 
 if __name__ == "__main__":
+    torch.set_grad_enabled(False)
+
     # Hyperparameters
 
     # model_name = "tiiuae/falcon-rw-1b"
-    model_name = "EleutherAI/gpt-neo-125m"
+    # model_name = "EleutherAI/gpt-neo-125m"
+    model_name = "results/checkpoint-7000"
     file_A = "data/eng_wikipedia_2016_1M-sentences.txt"
     file_B = "data/deu_wikipedia_2016_1M-sentences.txt"
     max_length = 64
+
+    do_clm = False
 
     # Load model
     model = AutoModelForCausalLM.from_pretrained(
@@ -42,89 +48,139 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     assert isinstance(model, PreTrainedModel)
-    assert isinstance(tokenizer, PreTrainedTokenizer)
+    # assert isinstance(tokenizer, PreTrainedTokenizer)
 
     # Modify to include extra tokens
     tokens = add_tokens_to_model(model, tokenizer)
 
+    # """
+    print(
+        model.get_input_embeddings()(
+            torch.tensor([tokens.placeholder.embedding.id]).cuda()
+        ),
+        model.get_input_embeddings()(torch.tensor([10]).cuda()),
+    )
+    # """
+
     # Make dataset
     dataset = ARAEDataset(tokenizer, file_A, file_B, max_length, tokens)
+    inputs = from_dict(data_class=ARAEInputs, data=dataset[10000])  # type: ignore
+    assert isinstance(inputs, ARAEInputs)
+
+    # """
+    print(tokenizer.decode(inputs.clm.input_ids), inputs.clm.attention_mask)
+    print(tokenizer.decode(inputs.enc.input_ids), inputs.enc.attention_mask)
+    print(tokenizer.decode(inputs.dec.input_ids), inputs.dec.attention_mask)
+    print(tokenizer.decode(inputs.cls.input_ids), inputs.cls.attention_mask)
+    # """
 
     # Enter eval loop
     while True:
         input_text = input("Input Text: ")
+        input_class = input("Input Class ID: ")
         output_class = input("Output Class ID: ")
 
-        cls_token_id = tokens.label.a.id if output_class == 0 else tokens.label.b.id
+        enc_cls_token_id = tokens.label.a.id if input_class == 0 else tokens.label.b.id
+        dec_cls_token_id = tokens.label.a.id if output_class == 0 else tokens.label.b.id
         text_token_ids = tokenizer.encode(input_text, add_special_tokens=False)
 
         pad_token_id = tokenizer.pad_token_id
         if pad_token_id is None:
             pad_token_id = 0
 
-        # Tokenize encoding task
-        enc_inputs = prepare_model_inputs(
-            [tokens.task.encoding.id, cls_token_id],
-            text_token_ids,
-            [tokens.placeholder.embedding.id],
-            max_length,
-            pad_token_id,
-        )
+        if do_clm:
+            # Tokenize CLM task
+            clm_inputs = prepare_model_inputs(
+                [tokens.task.modeling.id],
+                text_token_ids,
+                [],
+                max_length,
+                pad_token_id,
+                pad=False,
+            )
 
-        enc_input_ids = enc_inputs.input_ids.reshape(1, -1)
-        enc_input_ids = torch.from_numpy(enc_input_ids).cuda()
+            # Iteratively decode
+            output_token_ids = clm_inputs.input_ids.tolist()
 
-        enc_attention_mask = enc_inputs.attention_mask.reshape(1, -1)
-        enc_attention_mask = torch.from_numpy(enc_attention_mask).cuda()
+            for i in range(max_length - 3):
+                dec_input_ids = torch.tensor([output_token_ids]).cuda()
 
-        # Encode
-        enc_outputs = model(
-            input_ids=enc_input_ids,
-            attention_mask=enc_attention_mask,
-            output_hidden_states=True,
-        )
+                # Query next token
+                dec_outputs = model(input_ids=dec_input_ids)
 
-        assert isinstance(enc_outputs, CausalLMOutputWithPast)
-        assert isinstance(enc_outputs.hidden_states, tuple)
+                assert isinstance(dec_outputs, CausalLMOutputWithPast)
 
-        enc_embeddings = gather_from_tokens(
-            key=enc_input_ids,
-            values=enc_outputs.hidden_states[-1],
-            query=tokens.placeholder.embedding.id,
-        )
+                token_dist = Categorical(logits=dec_outputs.logits[0, -1, :50257])
+                next_token = token_dist.sample()
 
-        # Iteratively decode
-        output_token_ids = []
+                output_token_ids.append(next_token.item())
 
-        for i in range(max_length - 3):
-            dec_input_ids = [
-                tokens.task.decoding.id,
-                cls_token_id,
-                tokens.placeholder.embedding.id,
-            ]
+            output_text = tokenizer.decode(output_token_ids)
+            print(output_text)
+        else:
+            # Tokenize encoding task
+            enc_inputs = prepare_model_inputs(
+                [tokens.task.encoding.id, enc_cls_token_id],
+                text_token_ids,
+                [tokens.placeholder.embedding.id],
+                max_length,
+                pad_token_id,
+            )
 
-            dec_input_ids = torch.tensor([dec_input_ids + output_token_ids]).cuda()
+            enc_input_ids = enc_inputs.input_ids.reshape(1, -1)
+            enc_input_ids = torch.from_numpy(enc_input_ids).cuda()
 
-            # Construct decoding input
-            dec_input_embeddings = model.get_input_embeddings()(dec_input_ids)
-            dec_input_embeddings = scatter_to_tokens(
-                key=dec_input_ids,
-                source=enc_embeddings,
-                values=dec_input_embeddings,
+            enc_attention_mask = enc_inputs.attention_mask.reshape(1, -1)
+            enc_attention_mask = torch.from_numpy(enc_attention_mask).cuda()
+
+            # Encode
+            enc_outputs = model(
+                input_ids=enc_input_ids,
+                attention_mask=enc_attention_mask,
+                output_hidden_states=True,
+            )
+
+            assert isinstance(enc_outputs, CausalLMOutputWithPast)
+            assert isinstance(enc_outputs.hidden_states, tuple)
+
+            enc_embeddings = gather_from_tokens(
+                key=enc_input_ids,
+                values=enc_outputs.hidden_states[-1],
                 query=tokens.placeholder.embedding.id,
             )
 
-            # Query next token
-            dec_outputs = model(
-                input_embeddings=dec_input_embeddings,
-            )
+            # Iteratively decode
+            output_token_ids = []
 
-            assert isinstance(dec_outputs, CausalLMOutputWithPast)
+            for i in range(max_length - 3):
+                dec_input_ids = [
+                    tokens.task.decoding.id,
+                    dec_cls_token_id,
+                    tokens.placeholder.embedding.id,
+                ]
 
-            token_dist = Categorical(logits=dec_outputs.logits[0, -1])
-            next_token = token_dist.sample()
+                dec_input_ids = torch.tensor([dec_input_ids + output_token_ids]).cuda()
 
-            output_token_ids.append(next_token.item())
+                # Construct decoding input
+                dec_input_embeddings = model.get_input_embeddings()(dec_input_ids)
+                dec_input_embeddings = scatter_to_tokens(
+                    key=dec_input_ids,
+                    source=enc_embeddings,
+                    values=dec_input_embeddings,
+                    query=tokens.placeholder.embedding.id,
+                )
 
-        output_text = tokenizer.decode(output_token_ids)
-        print(output_text)
+                # Query next token
+                dec_outputs = model(
+                    inputs_embeds=dec_input_embeddings,
+                )
+
+                assert isinstance(dec_outputs, CausalLMOutputWithPast)
+
+                token_dist = Categorical(logits=dec_outputs.logits[0, -1, :50257])
+                next_token = token_dist.sample()
+
+                output_token_ids.append(next_token.item())
+
+            output_text = tokenizer.decode(output_token_ids)
+            print(output_text)
