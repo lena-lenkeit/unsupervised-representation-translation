@@ -34,7 +34,7 @@ if __name__ == "__main__":
 
     # model_name = "tiiuae/falcon-rw-1b"
     # model_name = "EleutherAI/gpt-neo-125m"
-    model_name = "results/checkpoint-7000"
+    model_name = "results/pythia-160m/checkpoint-3000"
     file_A = "data/eng_wikipedia_2016_1M-sentences.txt"
     file_B = "data/deu_wikipedia_2016_1M-sentences.txt"
     max_length = 64
@@ -58,6 +58,7 @@ if __name__ == "__main__":
         model.get_input_embeddings()(
             torch.tensor([tokens.placeholder.embedding.id]).cuda()
         ),
+        model.get_input_embeddings()(torch.tensor([tokens.label.a.id]).cuda()),
         model.get_input_embeddings()(torch.tensor([10]).cuda()),
     )
     # """

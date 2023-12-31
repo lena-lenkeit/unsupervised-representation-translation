@@ -9,6 +9,7 @@
 
 from typing import Any, Dict, List, Optional, TypedDict
 
+import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -27,14 +28,15 @@ if __name__ == "__main__":
     # Hyperparameters
 
     # model_name = "tiiuae/falcon-rw-1b"
-    model_name = "EleutherAI/gpt-neo-125m"
+    # model_name = "EleutherAI/gpt-neo-125m"
+    model_name = "EleutherAI/pythia-160m"
     file_A = "data/eng_wikipedia_2016_1M-sentences.txt"
     file_B = "data/deu_wikipedia_2016_1M-sentences.txt"
     max_length = 64
 
     # Load model
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, device_map="auto", torch_dtype="auto"
+        model_name, device_map="auto", torch_dtype=torch.float32
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -49,9 +51,9 @@ if __name__ == "__main__":
 
     # Define training arguments
     training_args = TrainingArguments(
-        output_dir="./results",
+        output_dir="./results/pythia-160m",
         num_train_epochs=1,
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=8,
         warmup_steps=0,
         weight_decay=0.0,
         logging_dir="./logs",
@@ -72,5 +74,5 @@ if __name__ == "__main__":
     )
 
     # Start training
-    # trainer.train(resume_from_checkpoint="results/checkpoint-5000")
+    # trainer.train(resume_from_checkpoint="results/pythia-70m/checkpoint-500")
     trainer.train()
