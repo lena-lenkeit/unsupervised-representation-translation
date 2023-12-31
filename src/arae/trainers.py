@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from dacite import from_dict
 from jaxtyping import Float, Int64
 from transformers import PreTrainedModel, Trainer
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_outputs import CausalLMOutput, CausalLMOutputWithPast
 
 import arae.losses as L
 from arae.tokens import ARAETokens
@@ -34,9 +34,11 @@ def cls_loss_fn(
         attention_mask=attention_mask,
     )
 
+    assert isinstance(outputs, (CausalLMOutput, CausalLMOutputWithPast))
+
     logits = gather_from_tokens(
         key=input_ids,
-        values=outputs["logits"],
+        values=outputs.logits,
         query=tokens.placeholder.label.id,
     )
     logits = logits[:, [tokens.label.a.id, tokens.label.b.id]]
@@ -80,7 +82,7 @@ class ARAETrainer(Trainer):
             input_ids=inputs.clm.input_ids,
             attention_mask=inputs.clm.attention_mask,
         )
-        assert isinstance(clm_outputs, CausalLMOutputWithPast)
+        assert isinstance(clm_outputs, (CausalLMOutput, CausalLMOutputWithPast))
 
         clm_loss = L.clm_loss_fn(
             logits=clm_outputs.logits,
@@ -96,7 +98,7 @@ class ARAETrainer(Trainer):
             attention_mask=inputs.enc.attention_mask,
             output_hidden_states=True,
         )
-        assert isinstance(enc_outputs, CausalLMOutputWithPast)
+        assert isinstance(enc_outputs, (CausalLMOutput, CausalLMOutputWithPast))
         assert isinstance(enc_outputs.hidden_states, tuple)
 
         enc_embeddings = gather_from_tokens(
@@ -121,7 +123,7 @@ class ARAETrainer(Trainer):
             inputs_embeds=dec_input_embeddings,
             attention_mask=inputs.dec.attention_mask,
         )
-        assert isinstance(dec_outputs, CausalLMOutputWithPast)
+        assert isinstance(dec_outputs, (CausalLMOutput, CausalLMOutputWithPast))
 
         ae_loss = L.clm_loss_fn(
             logits=dec_outputs.logits,
