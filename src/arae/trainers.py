@@ -27,6 +27,7 @@ def cls_loss_fn(
         source=embeddings,
         values=input_embeddings,
         query=tokens.placeholder.embedding.id,
+        allow_multiple=True,
     )
 
     outputs = model(

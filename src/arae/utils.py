@@ -30,16 +30,22 @@ def scatter_to_tokens(
     source: Float[torch.Tensor, "batch features"],
     values: Float[torch.Tensor, "batch sequence features"],
     query: int,
+    allow_multiple: bool = False,
 ) -> Float[torch.Tensor, "batch sequence features"]:
     batch, sequence, features = values.shape
 
-    _, index = torch.where(key == query)
-    assert index.shape[0] == values.shape[0], "Matched multiple tokens"
+    if not allow_multiple:
+        _, index = torch.where(key == query)
+        assert index.shape[0] == values.shape[0], "Matched multiple tokens"
 
-    index = index.reshape(batch, 1, 1)
-    index = index.expand(batch, 1, features)
-    source = source.reshape(batch, 1, features)
-    out = torch.scatter(values, 1, index, source)
+        index = index.reshape(batch, 1, 1)
+        index = index.expand(batch, 1, features)
+        source = source.reshape(batch, 1, features)
+        out = torch.scatter(values, 1, index, source)
+    else:
+        key = key.reshape(batch, sequence, 1)
+        source = source.reshape(batch, 1, features)
+        out = torch.where(key == query, source, values)
 
     return out
 

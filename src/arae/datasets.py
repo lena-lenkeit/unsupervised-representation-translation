@@ -79,6 +79,7 @@ class ARAEDataset(Dataset):
         file_B: str,
         max_length: int,
         tokens: ARAETokens,
+        num_cls_emb_tokens: int = 1,
     ):
         with open(file_A, "r") as f:
             self.sentences_A = [
@@ -95,6 +96,7 @@ class ARAEDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.tokens = tokens
+        self.num_cls_emb_tokens = num_cls_emb_tokens
 
     def __len__(self):
         return len(self.dataset)
@@ -146,14 +148,13 @@ class ARAEDataset(Dataset):
         )
 
         # Tokenize classification task (no need to handle text, just tokens)
+        num_cls_emb_tokens = (
+            self.max_length if self.num_cls_emb_tokens < 0 else self.num_cls_emb_tokens
+        )
         cls_inputs = prepare_model_inputs(
-            [
-                self.tokens.task.classification.id,
-                self.tokens.placeholder.embedding.id,
-                self.tokens.placeholder.label.id,
-            ],
-            [],
-            [],
+            [self.tokens.task.classification.id],
+            [self.tokens.placeholder.embedding.id] * num_cls_emb_tokens,
+            [self.tokens.placeholder.label.id],
             self.max_length,
             pad_token_id,
         )
