@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any, Dict, Mapping, NamedTuple, TypedDict, Union
 
 import torch
@@ -64,10 +65,29 @@ class ARAEInputs:
     cls_token_id: Int64[torch.Tensor, "batch"]
 
 
+class Mode(Enum):
+    SIM = auto()
+    ALT = auto()
+
+
+def sum_default(values: list, default: float = 0.0):
+    return sum([value if value is not None else default for value in values])
+
+
 class ARAETrainer(Trainer):
-    def __init__(self, *, tokens: ARAETokens, **kwargs):
-        self.tokens = tokens
+    def __init__(
+        self,
+        *,
+        tokens: ARAETokens,
+        mode: Mode = Mode.SIM,
+        enable_clm: bool = True,
+        **kwargs
+    ):
         super().__init__(**kwargs)
+
+        self.tokens = tokens
+        self.mode = mode
+        self.enable_clm = enable_clm
 
     def compute_loss(
         self,
@@ -78,18 +98,20 @@ class ARAETrainer(Trainer):
         inputs = from_dict(data_class=ARAEInputs, data=inputs)  # type: ignore
         assert isinstance(inputs, ARAEInputs)
 
-        # Causal language modelling loss
-        clm_outputs = model(
-            input_ids=inputs.clm.input_ids,
-            attention_mask=inputs.clm.attention_mask,
-        )
-        assert isinstance(clm_outputs, (CausalLMOutput, CausalLMOutputWithPast))
+        clm_loss = None
+        if self.enable_clm:
+            # Causal language modelling loss
+            clm_outputs = model(
+                input_ids=inputs.clm.input_ids,
+                attention_mask=inputs.clm.attention_mask,
+            )
+            assert isinstance(clm_outputs, (CausalLMOutput, CausalLMOutputWithPast))
 
-        clm_loss = L.clm_loss_fn(
-            logits=clm_outputs.logits,
-            labels=inputs.clm.input_ids,
-            mask=inputs.clm.attention_mask,
-        )
+            clm_loss = L.clm_loss_fn(
+                logits=clm_outputs.logits,
+                labels=inputs.clm.input_ids,
+                mask=inputs.clm.attention_mask,
+            )
 
         # Autoencoder loss
 
@@ -132,36 +154,56 @@ class ARAETrainer(Trainer):
             mask=inputs.dec.attention_mask,
         )
 
-        # Matching loss
-        model.requires_grad_(False)
-        adv_loss = cls_loss_fn(
-            model=model,
-            input_ids=inputs.cls.input_ids,
-            attention_mask=inputs.cls.attention_mask,
-            cls_ids=1 - inputs.cls_id,
-            embeddings=enc_embeddings,
-            tokens=self.tokens,
-        )
-        model.requires_grad_(True)
+        do_adv_step = None
+        do_cls_step = None
 
-        # Classification loss
-        cls_loss = cls_loss_fn(
-            model=model,
-            input_ids=inputs.cls.input_ids,
-            attention_mask=inputs.cls.attention_mask,
-            cls_ids=inputs.cls_id,
-            embeddings=enc_embeddings.detach(),
-            tokens=self.tokens,
-        )
+        if self.mode is Mode.SIM:
+            do_adv_step = True
+            do_cls_step = True
+        elif self.mode is Mode.ALT:
+            do_adv_step = self.state.global_step % 2 == 0
+            do_cls_step = self.state.global_step % 2 == 1
 
-        self.log_metrics(
-            split="train",
-            metrics={
-                "clm_loss": clm_loss,
-                "ae_loss": ae_loss,
-                "adv_loss": adv_loss,
-                "cls_loss": cls_loss,
-            },
-        )
+        assert do_adv_step is not None
+        assert do_cls_step is not None
 
-        return clm_loss + ae_loss + adv_loss + cls_loss
+        adv_loss = None
+        if do_adv_step:
+            # Adversarial loss
+            model.requires_grad_(False)
+            adv_loss = cls_loss_fn(
+                model=model,
+                input_ids=inputs.cls.input_ids,
+                attention_mask=inputs.cls.attention_mask,
+                cls_ids=1 - inputs.cls_id,
+                embeddings=enc_embeddings,
+                tokens=self.tokens,
+            )
+            model.requires_grad_(True)
+
+        cls_loss = None
+        if do_cls_step:
+            # Classification loss
+            cls_loss = cls_loss_fn(
+                model=model,
+                input_ids=inputs.cls.input_ids,
+                attention_mask=inputs.cls.attention_mask,
+                cls_ids=inputs.cls_id,
+                embeddings=enc_embeddings.detach(),
+                tokens=self.tokens,
+            )
+
+        do_log = self.state.global_step % self.state.logging_steps == 0
+        if do_log:
+            self.log_metrics(
+                split="train",
+                metrics={
+                    "clm_loss": clm_loss,
+                    "ae_loss": ae_loss,
+                    "adv_loss": adv_loss,
+                    "cls_loss": cls_loss,
+                },
+            )
+
+        loss = sum_default([clm_loss, ae_loss, adv_loss, cls_loss])
+        return loss
