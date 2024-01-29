@@ -9,8 +9,10 @@
 
 from typing import Any, Dict, List, Optional, TypedDict
 
+import hydra
 import torch
 from dacite import from_dict
+from omegaconf import DictConfig, OmegaConf
 from torch.distributions import Categorical
 from transformers import (
     AutoModelForCausalLM,
@@ -27,25 +29,19 @@ from arae.tokens import ARAETokens, LabelTokens, PlaceholderTokens, TaskTokens, 
 from arae.trainers import ARAETrainer
 from arae.utils import add_tokens_to_model, gather_from_tokens, scatter_to_tokens
 
-if __name__ == "__main__":
+
+@hydra.main(config_path="conf", config_name="config", version_base="1.3")
+def main(cfg: DictConfig) -> None:
     torch.set_grad_enabled(False)
-
-    # Hyperparameters
-
-    # model_name = "tiiuae/falcon-rw-1b"
-    # model_name = "EleutherAI/gpt-neo-125m"
-    model_name = "results/pythia-160m/checkpoint-3000"
-    file_A = "data/eng_wikipedia_2016_1M-sentences.txt"
-    file_B = "data/deu_wikipedia_2016_1M-sentences.txt"
-    max_length = 64
-
-    do_clm = False
 
     # Load model
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, device_map="auto", torch_dtype="auto"
+        "results/pythia-70m-ae-only/checkpoint-2000",
+        # cfg.model.name,
+        device_map="auto",
+        torch_dtype=torch.float32,
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
 
     assert isinstance(model, PreTrainedModel)
     # assert isinstance(tokenizer, PreTrainedTokenizer)
@@ -64,7 +60,14 @@ if __name__ == "__main__":
     # """
 
     # Make dataset
-    dataset = ARAEDataset(tokenizer, file_A, file_B, max_length, tokens)
+    dataset = ARAEDataset(
+        tokenizer,
+        cfg.data.file_A,
+        cfg.data.file_B,
+        cfg.data.max_length,
+        tokens,
+        cfg.data.num_cls_emb_tokens,
+    )
     inputs = from_dict(data_class=ARAEInputs, data=dataset[10000])  # type: ignore
     assert isinstance(inputs, ARAEInputs)
 
@@ -89,13 +92,13 @@ if __name__ == "__main__":
         if pad_token_id is None:
             pad_token_id = 0
 
-        if do_clm:
+        if cfg.eval.do_clm:
             # Tokenize CLM task
             clm_inputs = prepare_model_inputs(
                 [tokens.task.modeling.id],
                 text_token_ids,
                 [],
-                max_length,
+                cfg.data.max_length,
                 pad_token_id,
                 pad=False,
             )
@@ -103,7 +106,7 @@ if __name__ == "__main__":
             # Iteratively decode
             output_token_ids = clm_inputs.input_ids.tolist()
 
-            for i in range(max_length - 3):
+            for i in range(cfg.data.max_length - 3):
                 dec_input_ids = torch.tensor([output_token_ids]).cuda()
 
                 # Query next token
@@ -124,7 +127,7 @@ if __name__ == "__main__":
                 [tokens.task.encoding.id, enc_cls_token_id],
                 text_token_ids,
                 [tokens.placeholder.embedding.id],
-                max_length,
+                cfg.data.max_length,
                 pad_token_id,
             )
 
@@ -153,7 +156,7 @@ if __name__ == "__main__":
             # Iteratively decode
             output_token_ids = []
 
-            for i in range(max_length - 3):
+            for i in range(cfg.data.max_length - 3):
                 dec_input_ids = [
                     tokens.task.decoding.id,
                     dec_cls_token_id,
@@ -185,3 +188,7 @@ if __name__ == "__main__":
 
             output_text = tokenizer.decode(output_token_ids)
             print(output_text)
+
+
+if __name__ == "__main__":
+    main()

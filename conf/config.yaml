@@ -1,0 +1,31 @@
+defaults:
+  - _self_
+
+model:
+  name: EleutherAI/pythia-70m
+
+data:
+  file_A: data/eng_wikipedia_2016_1M-sentences.txt
+  file_B: data/deu_wikipedia_2016_1M-sentences.txt
+  max_length: 64
+  num_cls_emb_tokens: -1
+
+training:
+  output_dir: ./results/pythia-70m-ae-only
+  num_train_epochs: 1
+  per_device_train_batch_size: 32
+  warmup_steps: 0
+  weight_decay: 0.0
+  logging_dir: ./logs
+  logging_steps: 10
+  save_total_limit: 1
+  learning_rate: 1e-5
+  remove_unused_columns: False
+
+eval:
+  do_clm: false
+
+hydra:
+
+  run:
+    dir: .
