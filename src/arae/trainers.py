@@ -65,13 +65,19 @@ class ARAEInputs:
     cls_token_id: Int64[torch.Tensor, "batch"]
 
 
-class Mode(Enum):
-    SIM = auto()
-    ALT = auto()
+class Mode(str, Enum):
+    SIM = "SIM"
+    ALT = "ALT"
+
+
 
 
 def sum_default(values: list, default: float = 0.0):
     return sum([value if value is not None else default for value in values])
+
+
+def exclude_none(**kwargs):
+    return {k: v for k, v in kwargs.items() if v is not None}
 
 
 class ARAETrainer(Trainer):
@@ -157,10 +163,10 @@ class ARAETrainer(Trainer):
         do_adv_step = None
         do_cls_step = None
 
-        if self.mode is Mode.SIM:
+        if self.mode == Mode.SIM:
             do_adv_step = True
             do_cls_step = True
-        elif self.mode is Mode.ALT:
+        elif self.mode == Mode.ALT:
             do_adv_step = self.state.global_step % 2 == 0
             do_cls_step = self.state.global_step % 2 == 1
 
@@ -197,12 +203,12 @@ class ARAETrainer(Trainer):
         if do_log:
             self.log_metrics(
                 split="train",
-                metrics={
-                    "clm_loss": clm_loss,
-                    "ae_loss": ae_loss,
-                    "adv_loss": adv_loss,
-                    "cls_loss": cls_loss,
-                },
+                metrics=exclude_none(
+                    clm_loss=clm_loss,
+                    ae_loss=ae_loss,
+                    adv_loss=adv_loss,
+                    cls_loss=cls_loss,
+                ),
             )
 
         loss = sum_default([clm_loss, ae_loss, adv_loss, cls_loss])
