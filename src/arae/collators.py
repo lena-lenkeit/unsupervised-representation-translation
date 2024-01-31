@@ -12,6 +12,9 @@ class PyTreeCollator:
 
     def __call__(self, features: List[PyTree]) -> PyTree:
         def map_fn(x: Any, *xs: Any) -> Any:
+            if x is None:
+                return None
+
             if isinstance(x, torch.Tensor):
                 y = torch.stack((x,) + xs, dim=0)
             elif isinstance(x, np.ndarray):

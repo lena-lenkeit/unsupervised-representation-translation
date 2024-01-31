@@ -1,5 +1,5 @@
 from dataclasses import asdict, dataclass
-from typing import List, Union
+from typing import List, Optional, Union
 
 import numpy as np
 from jaxtyping import Int64
@@ -51,23 +51,31 @@ def prepare_model_inputs(
         token_ids = np.asarray(sequence_token_ids, dtype=np.int64)
         attention_mask = np.ones_like(token_ids)
 
-    return ARAETaskData(input_ids=token_ids, attention_mask=attention_mask)
+    return TokenIds(input_ids=token_ids, attention_mask=attention_mask)
 
 
 @dataclass
-class ARAETaskData:
-    input_ids: Int64[np.ndarray, "sequence"]
-    attention_mask: Int64[np.ndarray, "sequence"]
+class TokenIds:
+    input_ids: Int64[np.ndarray, "input_sequence"]
+    attention_mask: Int64[np.ndarray, "input_sequence"]
+    labels: Optional[Int64[np.ndarray, "target_sequence"]] = None
 
 
 @dataclass
 class ARAEInputs:
-    clm: ARAETaskData
-    enc: ARAETaskData
-    dec: ARAETaskData
-    cls: ARAETaskData
+    clm: TokenIds
+    enc: TokenIds
+    dec: TokenIds
+    cls: TokenIds
     cls_id: Int64[np.ndarray, ""]
     cls_token_id: Int64[np.ndarray, ""]
+
+
+@dataclass
+class EncDecInputs:
+    enc: TokenIds
+    dec: TokenIds
+    cls: TokenIds
 
 
 # Define a custom dataset
@@ -166,6 +174,122 @@ class ARAEDataset(Dataset):
             cls=cls_inputs,
             cls_id=np.asarray(label, dtype=np.int64),
             cls_token_id=np.asarray(cls_token_id, dtype=np.int64),
+        )
+
+        return asdict(inputs)
+
+
+class EncDecDataset(Dataset):
+    """Dataset for encoder-decoder language models"""
+
+    def __init__(
+        self,
+        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
+        file_A: str,
+        file_B: str,
+        max_length: int,
+        tokens: ARAETokens,
+    ):
+        with open(file_A, "r") as f:
+            self.sentences_A = [
+                line.split(maxsplit=1)[-1].strip() for line in f.readlines()
+            ]
+
+        with open(file_B, "r") as f:
+            self.sentences_B = [
+                line.split(maxsplit=1)[-1].strip() for line in f.readlines()
+            ]
+
+        self.dataset = self.sentences_A + self.sentences_B
+        self.labels = [0] * len(self.sentences_A) + [1] * len(self.sentences_B)
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.tokens = tokens
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int):
+        text = self.dataset[idx]
+        label = self.labels[idx]
+        cls_token = self.tokens.label.a if label == 0 else self.tokens.label.b
+
+        # Get padding token id
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        # Tokenize the text into token IDs
+        text_token_ids = self.tokenizer(
+            text, add_special_tokens=False
+        ).input_ids  # Don't add special tokens
+
+        # Notation:
+        # * [Token] - A token (string of text with associated id) and an associated
+        #   embedding.
+        # * {Vector} - A vector of size equal to a token embedding. These can't be
+        #   tokenized directly, instead requiring replacement of some placeholder token
+        #   with the intended values at a later stage.
+
+        # Tokenize encoding task:
+        # * To Encoder: [Encoding Task Token] [Class Token] [Data Token 1] ... [Data
+        #   Token N]
+        # * To Decoder: None
+        # * Note: The output here are the last hidden values of the encoder at the data
+        #   token positions, hence the decoder isn't used at all.
+        enc_inputs = prepare_model_inputs(
+            [self.tokens.task.encoding.id, cls_token.id],
+            text_token_ids,
+            [],
+            self.max_length,
+            pad_token_id,
+        )
+
+        # Tokenize decoding task:
+        # * To Encoder: [Decoding Task Token] [Class Token] {Encoder Outputs 1} ...
+        #   {Encoder Outputs N}
+        # * To Decoder: [Data Token 1] ... [Data Token N]
+        # * Note: Padding token as placeholder for the encoder outputs. Since the
+        #   padding token is explicitly included in the inputs, up to the length of the
+        #   encoded data, the attention mask will also include these tokens.
+        dec_inputs = prepare_model_inputs(
+            [self.tokens.task.decoding.id, cls_token.id],
+            [pad_token_id] * len(text_token_ids),
+            [],
+            self.max_length,
+            pad_token_id,
+        )
+        dec_inputs.labels = prepare_model_inputs(
+            [],
+            text_token_ids,
+            [],
+            self.max_length,
+            pad_token_id,
+        ).input_ids
+
+        # Tokenize classification task:
+        # * To Encoder: [Classification Task Token] {Encoder Outputs 1} ... {Encoder
+        #   Outputs N}
+        # * To Decoder: [Class Token]
+        cls_inputs = prepare_model_inputs(
+            [self.tokens.task.classification.id],
+            [pad_token_id] * len(text_token_ids),
+            [],
+            self.max_length,
+            pad_token_id,
+        )
+        cls_inputs.labels = prepare_model_inputs(
+            [],
+            [cls_token.id],
+            [],
+            self.max_length,
+            pad_token_id,
+        ).input_ids
+
+        inputs = EncDecInputs(
+            enc=enc_inputs,
+            dec=dec_inputs,
+            cls=cls_inputs,
         )
 
         return asdict(inputs)

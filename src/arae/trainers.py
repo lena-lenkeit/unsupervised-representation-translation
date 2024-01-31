@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Dict, Mapping, NamedTuple, TypedDict, Union
+from typing import Any, Dict, Mapping, NamedTuple, Optional, TypedDict, Union
 
 import torch
 import torch.nn.functional as F
@@ -50,17 +50,18 @@ def cls_loss_fn(
 
 
 @dataclass
-class ARAETaskData:
-    input_ids: Int64[torch.Tensor, "batch sequence"]
-    attention_mask: Int64[torch.Tensor, "batch sequence"]
+class TokenIds:
+    input_ids: Int64[torch.Tensor, "batch input_sequence"]
+    attention_mask: Int64[torch.Tensor, "batch input_sequence"]
+    labels: Optional[Int64[torch.Tensor, "batch target_sequence"]] = None
 
 
 @dataclass
 class ARAEInputs:
-    clm: ARAETaskData
-    enc: ARAETaskData
-    dec: ARAETaskData
-    cls: ARAETaskData
+    clm: TokenIds
+    enc: TokenIds
+    dec: TokenIds
+    cls: TokenIds
     cls_id: Int64[torch.Tensor, "batch"]
     cls_token_id: Int64[torch.Tensor, "batch"]
 
@@ -68,8 +69,6 @@ class ARAEInputs:
 class Mode(str, Enum):
     SIM = "SIM"
     ALT = "ALT"
-
-
 
 
 def sum_default(values: list, default: float = 0.0):
