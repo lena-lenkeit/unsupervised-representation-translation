@@ -76,6 +76,7 @@ class EncDecInputs:
     enc: TokenIds
     dec: TokenIds
     cls: TokenIds
+    adv: TokenIds
 
 
 # Define a custom dataset
@@ -213,6 +214,7 @@ class EncDecDataset(Dataset):
         text = self.dataset[idx]
         label = self.labels[idx]
         cls_token = self.tokens.label.a if label == 0 else self.tokens.label.b
+        adv_token = self.tokens.label.b if label == 0 else self.tokens.label.a
 
         # Get padding token id
         pad_token_id = self.tokenizer.pad_token_id
@@ -286,10 +288,27 @@ class EncDecDataset(Dataset):
             pad_token_id,
         ).input_ids
 
+        # Tokenize adversarial classification task:
+        # * To Encoder: [Classification Task Token] {Encoder Outputs 1} ... {Encoder
+        #   Outputs N}
+        # * To Decoder: [Adversarial Class Token]
+        adv_inputs = prepare_model_inputs(
+            [self.tokens.task.classification.id],
+            [pad_token_id] * len(text_token_ids),
+            [],
+            self.max_length,
+            pad_token_id,
+        )
+        adv_inputs.labels = prepare_model_inputs(
+            [],
+            [adv_token.id],
+            [],
+            self.max_length,
+            pad_token_id,
+        ).input_ids
+
         inputs = EncDecInputs(
-            enc=enc_inputs,
-            dec=dec_inputs,
-            cls=cls_inputs,
+            enc=enc_inputs, dec=dec_inputs, cls=cls_inputs, adv=adv_inputs
         )
 
         return asdict(inputs)
