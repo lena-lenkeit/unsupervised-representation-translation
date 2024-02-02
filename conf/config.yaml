@@ -1,26 +1,38 @@
 defaults:
   - _self_
 
+model_type: CAUSAL
+
 model:
-  name: EleutherAI/pythia-70m
+  pretrained_model_name_or_path: EleutherAI/pythia-70m
+  attention_dropout: 0.1
+  hidden_dropout: 0.1
+  classifier_dropout: 0.1
+
+tokenizer:
+  pretrained_model_name_or_path: EleutherAI/pythia-70m
 
 data:
   file_A: data/eng_wikipedia_2016_1M-sentences.txt
   file_B: data/deu_wikipedia_2016_1M-sentences.txt
   max_length: 64
-  num_cls_emb_tokens: -1
+  num_cls_emb_tokens: 1
 
 training:
-  output_dir: ./results/pythia-70m-ae-only
+  output_dir: ./results/pythia-70m-alt-dropout
   num_train_epochs: 1
-  per_device_train_batch_size: 32
+  per_device_train_batch_size: 16
   warmup_steps: 0
   weight_decay: 0.0
   logging_dir: ./logs
-  logging_steps: 10
+  logging_steps: 9
   save_total_limit: 1
-  learning_rate: 1e-5
+  learning_rate: 5e-5
   remove_unused_columns: False
+
+trainer:
+  mode: ALT
+  enable_clm: false
 
 eval:
   do_clm: false
