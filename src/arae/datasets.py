@@ -1,7 +1,11 @@
+import base64
 from dataclasses import asdict, dataclass
+from itertools import cycle
 from typing import List, Optional, Union
 
+import datasets
 import numpy as np
+import xor_cipher
 from jaxtyping import Int64
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
