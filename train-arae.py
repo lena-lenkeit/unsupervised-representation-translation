@@ -1,11 +1,17 @@
 import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from transformers import (
+    PreTrainedModel,
+    PreTrainedTokenizer,
+    PreTrainedTokenizerFast,
+    TrainingArguments,
+)
 
 from arae.collators import PyTreeCollator
-from arae.datasets import ARAEDataset
-from arae.trainers import ARAETrainer
+from arae.datasets import ARAEDataset, EncDecDataset
+from arae.models import ModelType
+from arae.trainers import ARAETrainer, EncDecTrainer
 from arae.utils import add_tokens_to_model
 
 
@@ -14,30 +20,26 @@ def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 
     # Load model
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model.name, device_map="auto", torch_dtype=torch.float32
+    model = hydra.utils.instantiate(
+        cfg.model, device_map="auto", torch_dtype=torch.float32
     )
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
+    tokenizer = hydra.utils.instantiate(cfg.tokenizer)
+
+    assert isinstance(model, PreTrainedModel)
+    assert isinstance(tokenizer, (PreTrainedTokenizer, PreTrainedTokenizerFast))
 
     # Modify to include extra tokens
     tokens = add_tokens_to_model(model, tokenizer)
 
     # Make dataset
-    dataset = ARAEDataset(
-        tokenizer,
-        cfg.data.file_A,
-        cfg.data.file_B,
-        cfg.data.max_length,
-        tokens,
-        cfg.data.num_cls_emb_tokens,
-    )
+    dataset = hydra.utils.instantiate(cfg.dataset, tokenizer=tokenizer, tokens=tokens)
     collator = PyTreeCollator()
 
     # Define training arguments
     training_args = TrainingArguments(**cfg.training)
 
     # Trainer
-    trainer = ARAETrainer(
+    trainer = hydra.utils.instantiate(cfg.trainer)(
         tokens=tokens,
         model=model,
         args=training_args,
