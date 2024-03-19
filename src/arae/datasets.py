@@ -13,6 +13,27 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 from arae.tokens import ARAETokens
 
 
+def combine_tokens(
+    prefix_token_ids: List[int],
+    text_token_ids: List[int],
+    postfix_token_ids: List[int],
+    max_length: int = -1,
+) -> List[int]:
+    truncate = max_length != -1
+    special_length = len(prefix_token_ids) + len(postfix_token_ids)
+
+    if truncate:
+        assert (
+            special_length <= max_length
+        ), "Too many prefix and postfix tokens to fit inside maximum sequence length"
+
+        text_max_length = max_length - special_length
+        text_token_ids = text_token_ids[:text_max_length]
+
+    sequence_token_ids = prefix_token_ids + text_token_ids + postfix_token_ids
+    return sequence_token_ids
+
+
 # Helper function to truncate token IDs and create attention mask
 def pad_tokens(token_ids: List[int], max_length: int, pad_token_id: int):
     attention_mask = [1] * len(token_ids)
