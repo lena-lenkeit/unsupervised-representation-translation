@@ -28,9 +28,9 @@ def encode(
     attention_mask: Int64[torch.Tensor, "batch input_sequence"],
     num_prefix_tokens: int,
 ):
-    output = model(input_ids=input_ids, attention_mask=attention_mask)
+    output = model.get_encoder()(input_ids=input_ids, attention_mask=attention_mask)
 
-    embeddings = output.encoder_last_hidden_state[:, num_prefix_tokens:]
+    embeddings = output.last_hidden_state[:, num_prefix_tokens:]
     return embeddings
 
 
@@ -43,7 +43,10 @@ def decode(
     num_prefix_tokens: int,
 ) -> Seq2SeqLMOutput:
     input_embeddings = model.get_input_embeddings()(input_ids)
-    input_embeddings[:, num_prefix_tokens:] = embeddings
+    input_embeddings[
+        :,
+        num_prefix_tokens : embeddings.shape[1] + num_prefix_tokens,
+    ] = embeddings
 
     output = model(
         inputs_embeds=input_embeddings, attention_mask=attention_mask, labels=labels
@@ -51,14 +54,35 @@ def decode(
     return output
 
 
+def classification_loss_bce(
+    logits: torch.Tensor, labels: torch.Tensor, tokens: ARAETokens
+) -> torch.Tensor:
+    # Use the padding token as the classification logit, sampled at the first position
+    logits = logits[:, 0, 0]
+
+    # Derive the class from the labels
+    classes = (labels[:, 0] == tokens.label.a.id).to(logits.dtype)
+
+    loss = F.binary_cross_entropy_with_logits(logits, classes)
+    return loss
+
+
 class EncDecTrainer(Trainer):
     """Trainer for encoder-decoder models to perform unsupervised translation"""
 
-    def __init__(self, *, tokens: ARAETokens, mode: Mode = Mode.SIM, **kwargs):
+    def __init__(
+        self,
+        *,
+        tokens: ARAETokens,
+        mode: Mode = Mode.SIM,
+        ae_loss_weight: float = 1.0,
+        **kwargs
+    ):
         super().__init__(**kwargs)
 
         self.tokens = tokens
         self.mode = mode
+        self.ae_loss_weight = ae_loss_weight
 
     def compute_loss(
         self,
@@ -114,11 +138,14 @@ class EncDecTrainer(Trainer):
                 model=model,
                 input_ids=inputs.adv.input_ids,
                 attention_mask=inputs.adv.attention_mask,
-                labels=inputs.cls.labels,
+                labels=inputs.adv.labels,
                 embeddings=encoding_embeddings,
                 num_prefix_tokens=1,
             )
-            adv_loss = adv_classification_output.loss
+            # adv_loss = adv_classification_output.loss
+            adv_loss = classification_loss_bce(
+                adv_classification_output.logits, inputs.adv.labels, self.tokens
+            )
             model.requires_grad_(True)
 
         cls_loss = None
@@ -132,7 +159,10 @@ class EncDecTrainer(Trainer):
                 embeddings=encoding_embeddings.detach(),
                 num_prefix_tokens=1,
             )
-            cls_loss = classification_output.loss
+            # cls_loss = classification_output.loss
+            cls_loss = classification_loss_bce(
+                classification_output.logits, inputs.cls.labels, self.tokens
+            )
 
         do_log = self.state.global_step % self.state.logging_steps == 0
         if do_log:
@@ -145,5 +175,5 @@ class EncDecTrainer(Trainer):
                 ),
             )
 
-        loss = sum_default([ae_loss, adv_loss, cls_loss])
+        loss = sum_default([ae_loss * self.ae_loss_weight, adv_loss, cls_loss])
         return loss
