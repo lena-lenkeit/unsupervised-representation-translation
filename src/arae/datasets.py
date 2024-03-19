@@ -326,3 +326,36 @@ class EncDecDataset(Dataset):
         )
 
         return asdict(inputs)
+
+
+def make_wikisentence_dataset(wikisentence_file_path: str):
+    def clean_line(line: str) -> str:
+        return line.split(maxsplit=1)[-1].strip()
+
+    dataset = datasets.load_dataset(
+        "text", data_files=wikisentence_file_path, streaming=True
+    )
+    dataset = dataset.map(clean_line)
+
+    return dataset
+
+
+def make_chat_translate_dataset(
+    chat_dataset_path: str, wikisentence_file_path: str, xor_key: str
+):
+    def encode_text(text: str) -> str:
+        text_xor = xor_cipher.cyclic_xor(text.encode("utf-8"), xor_key.encode("utf-8"))
+        text_xor_b64 = base64.standard_b64encode(text_xor).decode("utf-8")
+
+        return text_xor_b64
+
+    chat_dataset = datasets.load_dataset(chat_dataset_path, streaming=True)
+    wikisentence_dataset = make_wikisentence_dataset(wikisentence_file_path)
+    wikisentence_crypt_dataset = wikisentence_dataset.map(encode_text)
+
+    dataset = datasets.interleave_datasets(
+        [chat_dataset, wikisentence_dataset, wikisentence_crypt_dataset],
+        [0.5, 0.25, 0.25],
+    )
+
+def make_
