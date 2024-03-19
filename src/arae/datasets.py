@@ -29,6 +29,7 @@ def prepare_model_inputs(
     max_length: int,
     pad_token_id: int,
     pad: bool = True,
+    return_text_length: bool = False,
 ):
     special_length = len(prefix_token_ids) + len(postfix_token_ids)
     text_max_length = max_length - special_length
@@ -51,7 +52,15 @@ def prepare_model_inputs(
         token_ids = np.asarray(sequence_token_ids, dtype=np.int64)
         attention_mask = np.ones_like(token_ids)
 
-    return TokenIds(input_ids=token_ids, attention_mask=attention_mask)
+    if return_text_length:
+        return TokenIds(input_ids=token_ids, attention_mask=attention_mask), len(
+            text_token_ids
+        )
+    else:
+        return TokenIds(input_ids=token_ids, attention_mask=attention_mask)
+
+
+# def pad(token_ids: TokenIds, pad_token_id: int, max_length: int) -> TokenIds:
 
 
 @dataclass
@@ -185,11 +194,12 @@ class EncDecDataset(Dataset):
 
     def __init__(
         self,
+        *,
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
+        tokens: ARAETokens,
         file_A: str,
         file_B: str,
         max_length: int,
-        tokens: ARAETokens,
     ):
         with open(file_A, "r") as f:
             self.sentences_A = [
@@ -221,6 +231,9 @@ class EncDecDataset(Dataset):
         if pad_token_id is None:
             pad_token_id = 0
 
+        # ID of tokens masked from the loss during decoding, if specified in 'labels'
+        decode_ignore_id = -100
+
         # Tokenize the text into token IDs
         text_token_ids = self.tokenizer(
             text, add_special_tokens=False
@@ -239,13 +252,14 @@ class EncDecDataset(Dataset):
         # * To Decoder: None
         # * Note: The output here are the last hidden values of the encoder at the data
         #   token positions, hence the decoder isn't used at all.
-        enc_inputs = prepare_model_inputs(
+        enc_inputs, enc_text_len = prepare_model_inputs(
             [self.tokens.task.encoding.id, cls_token.id],
             text_token_ids,
             [],
             self.max_length,
             pad_token_id,
-        )
+            return_text_length=True,
+        )  # type: ignore
 
         # Tokenize decoding task:
         # * To Encoder: [Decoding Task Token] [Class Token] {Encoder Outputs 1} ...
@@ -256,7 +270,7 @@ class EncDecDataset(Dataset):
         #   encoded data, the attention mask will also include these tokens.
         dec_inputs = prepare_model_inputs(
             [self.tokens.task.decoding.id, cls_token.id],
-            [pad_token_id] * len(text_token_ids),
+            [pad_token_id] * enc_text_len,
             [],
             self.max_length,
             pad_token_id,
@@ -266,7 +280,7 @@ class EncDecDataset(Dataset):
             text_token_ids,
             [],
             self.max_length,
-            pad_token_id,
+            decode_ignore_id,
         ).input_ids
 
         # Tokenize classification task:
@@ -275,7 +289,7 @@ class EncDecDataset(Dataset):
         # * To Decoder: [Class Token]
         cls_inputs = prepare_model_inputs(
             [self.tokens.task.classification.id],
-            [pad_token_id] * len(text_token_ids),
+            [pad_token_id] * enc_text_len,
             [],
             self.max_length,
             pad_token_id,
@@ -284,7 +298,7 @@ class EncDecDataset(Dataset):
             [],
             [cls_token.id],
             [],
-            self.max_length,
+            1,
             pad_token_id,
         ).input_ids
 
@@ -294,7 +308,7 @@ class EncDecDataset(Dataset):
         # * To Decoder: [Adversarial Class Token]
         adv_inputs = prepare_model_inputs(
             [self.tokens.task.classification.id],
-            [pad_token_id] * len(text_token_ids),
+            [pad_token_id] * enc_text_len,
             [],
             self.max_length,
             pad_token_id,
@@ -303,7 +317,7 @@ class EncDecDataset(Dataset):
             [],
             [adv_token.id],
             [],
-            self.max_length,
+            1,
             pad_token_id,
         ).input_ids
 
