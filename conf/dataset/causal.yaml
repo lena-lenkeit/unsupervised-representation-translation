@@ -1,0 +1,8 @@
+# @package _global_
+
+dataset:
+  _target_: arae.datasets.ARAEDataset
+  file_A: data/eng_wikipedia_2016_1M-sentences.txt
+  file_B: data/deu_wikipedia_2016_1M-sentences.txt
+  max_length: 64
+  num_cls_emb_tokens: 1

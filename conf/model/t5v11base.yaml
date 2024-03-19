@@ -1,0 +1,14 @@
+# @package _global_
+
+model_type: T5LIKE_ENC_DEC
+
+model:
+  _target_: transformers.T5ForConditionalGeneration.from_pretrained
+  pretrained_model_name_or_path: google/t5-v1_1-base
+  dropout_rate: 0.0
+  classifier_dropout: 0.0
+
+tokenizer:
+  _target_: transformers.T5Tokenizer.from_pretrained
+  pretrained_model_name_or_path: google/t5-v1_1-base
+

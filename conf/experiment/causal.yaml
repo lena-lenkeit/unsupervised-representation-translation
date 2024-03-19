@@ -1,0 +1,8 @@
+# @package _global_
+
+defaults:
+  - override /model: pythia40m
+  - _self_
+
+trainer:
+  enable_clm: false

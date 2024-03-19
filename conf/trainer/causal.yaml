@@ -1,0 +1,6 @@
+# @package _global_
+
+trainer:
+  _target_: arae.trainers.ARAETrainer
+  mode: ALT
+  enable_clm: false

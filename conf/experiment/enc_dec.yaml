@@ -1,0 +1,10 @@
+# @package _global_
+
+defaults:
+  - override /model: t5small
+  - override /dataset: enc_dec
+  - override /trainer: enc_dec
+  - _self_
+
+training:
+  output_dir: ./results/t5-small

@@ -1,22 +1,8 @@
 defaults:
+  - model: pythia40m
+  - dataset: causal
+  - trainer: causal
   - _self_
-
-model_type: CAUSAL
-
-model:
-  pretrained_model_name_or_path: EleutherAI/pythia-70m
-  attention_dropout: 0.1
-  hidden_dropout: 0.1
-  classifier_dropout: 0.1
-
-tokenizer:
-  pretrained_model_name_or_path: EleutherAI/pythia-70m
-
-data:
-  file_A: data/eng_wikipedia_2016_1M-sentences.txt
-  file_B: data/deu_wikipedia_2016_1M-sentences.txt
-  max_length: 64
-  num_cls_emb_tokens: 1
 
 training:
   output_dir: ./results/pythia-70m-alt-dropout
@@ -28,16 +14,14 @@ training:
   logging_steps: 9
   save_total_limit: 1
   learning_rate: 5e-5
+  lr_scheduler_type: constant
   remove_unused_columns: False
-
-trainer:
-  mode: ALT
-  enable_clm: false
+  gradient_checkpointing: True
+  optim: adamw_bnb_8bit
 
 eval:
   do_clm: false
 
 hydra:
-
   run:
     dir: .
