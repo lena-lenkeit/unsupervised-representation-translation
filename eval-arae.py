@@ -19,29 +19,37 @@ from transformers import (
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizer,
+    PreTrainedTokenizerFast,
+    T5ForConditionalGeneration,
+    T5TokenizerFast,
     TrainingArguments,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from arae.collators import PyTreeCollator
-from arae.datasets import ARAEDataset, ARAEInputs, prepare_model_inputs
+from arae.datasets import (
+    ARAEDataset,
+    ARAEInputs,
+    EncDecDataset,
+    EncDecInputs,
+    prepare_model_inputs,
+)
+from arae.models import ModelType
 from arae.tokens import ARAETokens, LabelTokens, PlaceholderTokens, TaskTokens, Token
 from arae.trainers import ARAETrainer
 from arae.utils import add_tokens_to_model, gather_from_tokens, scatter_to_tokens
 
 
-@hydra.main(config_path="conf", config_name="config", version_base="1.3")
-def main(cfg: DictConfig) -> None:
+def eval_causal(cfg: DictConfig):
     torch.set_grad_enabled(False)
 
     # Load model
     model = AutoModelForCausalLM.from_pretrained(
-        "results/pythia-70m-ae-only/checkpoint-2000",
-        # cfg.model.name,
+        "results/pythia-70m-alt-dropout/checkpoint-1000",
         device_map="auto",
         torch_dtype=torch.float32,
     )
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name)
+    tokenizer = AutoTokenizer.from_pretrained(**cfg.tokenizer)
 
     assert isinstance(model, PreTrainedModel)
     # assert isinstance(tokenizer, PreTrainedTokenizer)
@@ -188,6 +196,114 @@ def main(cfg: DictConfig) -> None:
 
             output_text = tokenizer.decode(output_token_ids)
             print(output_text)
+
+
+def eval_t5like_enc_dec(cfg: DictConfig):
+    torch.set_grad_enabled(False)
+
+    # Load model
+    model_path = "./results/t5base-bce/checkpoint-9000"
+
+    model = T5ForConditionalGeneration.from_pretrained(
+        model_path, device_map="auto", torch_dtype=torch.float32
+    )
+    tokenizer = T5TokenizerFast.from_pretrained(model_path)
+
+    assert isinstance(model, PreTrainedModel)
+    assert isinstance(tokenizer, (PreTrainedTokenizer, PreTrainedTokenizerFast))
+
+    tokens = add_tokens_to_model(model, tokenizer)
+
+    print(
+        model.get_input_embeddings()(
+            torch.tensor([tokens.placeholder.embedding.id]).cuda()
+        ),
+        model.get_input_embeddings()(torch.tensor([tokens.label.a.id]).cuda()),
+        model.get_input_embeddings()(torch.tensor([10]).cuda()),
+        model.get_input_embeddings()(torch.tensor([tokenizer.pad_token_id]).cuda()),
+    )
+
+    # Make dataset
+    dataset = hydra.utils.instantiate(cfg.dataset, tokenizer=tokenizer, tokens=tokens)
+
+    inputs = from_dict(data_class=EncDecInputs, data=dataset[10000])  # type: ignore
+    assert isinstance(inputs, EncDecInputs)
+
+    print(tokenizer.decode(inputs.enc.input_ids), inputs.enc.attention_mask)
+    print(tokenizer.decode(inputs.dec.input_ids), inputs.dec.attention_mask)
+    print(tokenizer.decode(inputs.cls.input_ids), inputs.cls.attention_mask)
+
+    max_length = cfg.dataset.max_length
+    pad_token_id = tokenizer.pad_token_id
+
+    # Enter eval loop
+    while True:
+        input_text = input("Input Text: ")
+        input_class = input("Input Class ID: ")
+        output_class = input("Output Class ID: ")
+
+        in_cls_token = tokens.label.a if input_class == 0 else tokens.label.b
+        out_cls_token = tokens.label.a if output_class == 0 else tokens.label.b
+
+        text_token_ids = tokenizer(
+            input_text, add_special_tokens=False
+        ).input_ids  # Don't add special tokens
+
+        enc_inputs, enc_text_len = prepare_model_inputs(
+            [tokens.task.encoding.id, in_cls_token.id],
+            text_token_ids,
+            [],
+            max_length,
+            pad_token_id,
+            return_text_length=True,
+        )  # type: ignore
+
+        dec_inputs = prepare_model_inputs(
+            [tokens.task.decoding.id, out_cls_token.id],
+            [pad_token_id] * enc_text_len,
+            [],
+            max_length,
+            pad_token_id,
+        )  # type: ignore
+
+        # Encode
+        enc_input_ids = enc_inputs.input_ids.reshape(1, -1)
+        enc_input_ids = torch.from_numpy(enc_input_ids).cuda()
+
+        enc_attention_mask = enc_inputs.attention_mask.reshape(1, -1)
+        enc_attention_mask = torch.from_numpy(enc_attention_mask).cuda()
+
+        output = model.get_encoder()(
+            input_ids=enc_input_ids, attention_mask=enc_attention_mask
+        )
+        embeddings = output.last_hidden_state[:, 2:]
+
+        # Decode
+        dec_input_ids = dec_inputs.input_ids.reshape(1, -1)
+        dec_input_ids = torch.from_numpy(dec_input_ids).cuda()
+
+        dec_attention_mask = dec_inputs.attention_mask.reshape(1, -1)
+        dec_attention_mask = torch.from_numpy(dec_attention_mask).cuda()
+
+        input_embeddings = model.get_input_embeddings()(dec_input_ids)
+        input_embeddings[:, 2 : embeddings.shape[1] + 2] = embeddings
+
+        gen_token_ids = model.generate(
+            inputs_embeds=input_embeddings, attention_mask=dec_attention_mask
+        )
+
+        gen_token_ids = gen_token_ids[0].cpu().numpy()
+        print(tokenizer.decode(gen_token_ids))
+
+
+@hydra.main(config_path="conf", config_name="config", version_base="1.3")
+def main(cfg: DictConfig):
+    if cfg.model_type == ModelType.CAUSAL:
+        eval_causal(cfg)
+    elif cfg.model_type == ModelType.T5LIKE_ENC_DEC:
+        eval_t5like_enc_dec(cfg)
+    else:
+        raise ValueError(cfg.model_type)
 
 
 if __name__ == "__main__":
