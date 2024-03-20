@@ -106,7 +106,8 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
         encoder_last_hidden_state = autoencoding_outputs.encoder_last_hidden_state
         assert encoder_last_hidden_state is not None
 
-        do_encoder_step = self.state.global_step % 2 == 0
+        num_classifier_steps = 1
+        do_encoder_step = self.state.global_step % (num_classifier_steps + 1) == 0
         if do_encoder_step:
             # Invert the label, so that G is trained to fool D into predicting the wrong
             # label of the latents
