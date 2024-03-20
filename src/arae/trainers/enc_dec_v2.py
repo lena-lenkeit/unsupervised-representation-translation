@@ -36,22 +36,43 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
         return_outputs: bool = False,
     ):
         # Retrieve base inputs from batch
-        # * (encoder_)input_ids should be [LABEL_TOKEN] [TEXT_TOKEN_1] ...
-        # * decoder_input_ids should be [LABEL_TOKEN] [TEXT_TOKEN_1] ...
-        # * labels should be the label ids
+        # * (encoder_)input_ids should be [TEXT_TOKEN_1] ...
+        # * labels should be the language label ids {0, 1}
+        # * everything else is derived automatically
         input_ids: torch.Tensor = inputs["input_ids"]
         attention_mask: torch.Tensor = inputs["attention_mask"]
-        # decoder_input_ids: torch.Tensor = inputs["decoder_input_ids"]
-        # decoder_attention_mask: torch.Tensor = inputs["decoder_attention_mask"]
         labels: torch.Tensor = inputs["labels"]
 
         # Autoencoding (for representation learning)
+
+        # Construct inputs
+        # * Encoder: [LABELi_TOKEN] [TEXT_TOKEN_1] ...
+        # * Decoder: [LABELi_TOKEN] [TEXT_TOKEN_1] ...
+        # * Labels: [TEXT_TOKEN_1] ..., masked at encoder [PAD] tokens
+
+        # Shift right to make space for the label token, and add it
+        autoencoding_input_ids = torch.roll(input_ids.clone(), 1, dims=1)
+        autoencoding_input_ids[:, 0] = torch.where(
+            labels == 0, self.label0_token_id, self.label1_token_id
+        )
+
+        # Shift right and set active to include label token in mask
+        autoencoding_attention_mask = torch.roll(attention_mask.clone(), 1, dims=1)
+        autoencoding_attention_mask[:, 0] = 1
+
+        # Mask labels at encoder [PAD] tokens
+        autoencoding_labels = torch.where(
+            autoencoding_input_ids == self.tokenizer.pad_token_id,
+            -100,
+            input_ids.clone(),
+        )
+
         autoencoding_outputs: Seq2SeqLMOutput = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            # decoder_input_ids=input_ids,
-            # decoder_attention_mask=attention_mask,
-            labels=input_ids,
+            input_ids=autoencoding_input_ids,
+            attention_mask=autoencoding_attention_mask,
+            decoder_input_ids=autoencoding_input_ids,
+            decoder_attention_mask=autoencoding_attention_mask,
+            labels=autoencoding_labels,
         )
 
         autoencoding_loss = autoencoding_outputs.loss
