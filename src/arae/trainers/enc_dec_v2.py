@@ -127,6 +127,8 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
             # the gradients enabled, and here I reuse it for efficiency, instead of
             # recomputing it with gradients disabled
             encoder_last_hidden_state = encoder_last_hidden_state.detach()
+            encoder_last_hidden_state.requires_grad_(True)
+
         # Instance Noise
         # noise_interp = min(1, self.state.global_step / 500)
         # encoder_last_hidden_state = noise_interp * encoder_last_hidden_state + (
@@ -145,6 +147,36 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
 
         classifier_loss = F.cross_entropy(classifier_logits, classifier_labels)
 
+        # Gradient penality
+        gradient_penalty = 0.0
+        if not do_encoder_step:
+            classifier_binary_prob = F.softmax(classifier_logits, dim=1)
+            # classifier_binary_prob = classifier_logits
+
+            classifier_binary_prob = torch.where(
+                classifier_labels == 1,
+                classifier_binary_prob[:, 1],
+                classifier_binary_prob[:, 0],
+            )
+
+            # classifier_binary_prob = classifier_binary_prob[::2]
+            # classifier_labels = classifier_labels[::2]
+
+            classifier_grads = torch.autograd.grad(
+                outputs=classifier_binary_prob,
+                inputs=encoder_last_hidden_state,
+                grad_outputs=torch.ones_like(classifier_binary_prob),
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True,
+            )[0]
+
+            print(classifier_labels)
+
+            gradient_penalty = torch.mean(
+                torch.square(classifier_grads.norm(p=2, dim=(1, 2)))
+            )
+
         if do_encoder_step:
             # Turn gradients back on for next training step
             model.get_decoder().requires_grad_(True)
@@ -155,12 +187,18 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
 
         do_log_step = self.state.global_step % self.state.logging_steps == 0
         if do_log_step:
+            classifier_loss_name = "Encoder" if do_encoder_step else "Classifier"
+            classifier_loss_name = classifier_loss_name + " Loss"
+
             self.log_metrics(
                 split="train",
-                metrics=dict(
-                    autoencoding_loss=autoencoding_loss, classifier_loss=classifier_loss
-                ),
+                metrics={
+                    "Autoencoder Loss": autoencoding_loss,
+                    classifier_loss_name: classifier_loss,
+                    # "Instance Noise": 1 - noise_interp,
+                    "Gradient Penalty": gradient_penalty,
+                },
             )
 
-        loss = autoencoding_loss + classifier_loss
+        loss = autoencoding_loss + classifier_loss * 5 + gradient_penalty * 50
         return loss
