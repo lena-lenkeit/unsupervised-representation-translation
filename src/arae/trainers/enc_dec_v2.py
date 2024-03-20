@@ -35,6 +35,12 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
         inputs: Dict[str, Any],
         return_outputs: bool = False,
     ):
+        assert self.tokenizer is not None
+
+        # Enable dropout only in encoder, forming a denoising autoencoder
+        model.get_encoder().train()
+        model.get_decoder().eval()
+
         # Retrieve base inputs from batch
         # * (encoder_)input_ids should be [TEXT_TOKEN_1] ...
         # * labels should be the language label ids {0, 1}
