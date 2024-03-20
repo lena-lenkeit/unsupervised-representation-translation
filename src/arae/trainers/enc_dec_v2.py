@@ -127,6 +127,11 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
             # the gradients enabled, and here I reuse it for efficiency, instead of
             # recomputing it with gradients disabled
             encoder_last_hidden_state = encoder_last_hidden_state.detach()
+        # Instance Noise
+        # noise_interp = min(1, self.state.global_step / 500)
+        # encoder_last_hidden_state = noise_interp * encoder_last_hidden_state + (
+        #    1 - noise_interp
+        # ) * torch.randn_like(encoder_last_hidden_state)
 
         classifier_outputs: Seq2SeqLMOutput = model(
             encoder_outputs=(encoder_last_hidden_state,),
