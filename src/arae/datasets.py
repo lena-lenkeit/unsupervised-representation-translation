@@ -1,7 +1,7 @@
 import base64
 from dataclasses import asdict, dataclass
 from itertools import cycle
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import datasets
 import numpy as np
@@ -353,14 +353,15 @@ class EncDecDataset(Dataset):
         return asdict(inputs)
 
 
-def make_wikisentence_dataset(wikisentence_file_path: str):
-    def clean_line(line: str) -> str:
-        return line.split(maxsplit=1)[-1].strip()
+def make_wikisentence_dataset(filepath: str):
+    def clean_line(row: Dict[str, Any]) -> Dict[str, Any]:
+        text: str = row["text"]
+        text = text.split(maxsplit=1)[-1].strip()
 
-    dataset = datasets.load_dataset(
-        "text", data_files=wikisentence_file_path, streaming=True
-    )
-    dataset = dataset.map(clean_line)
+        return {"text": text}
+
+    dataset = datasets.load_dataset("text", split="train", data_files=filepath)
+    dataset = dataset.shuffle().to_iterable_dataset().map(clean_line)
 
     return dataset
 
@@ -382,5 +383,3 @@ def make_chat_translate_dataset(
         [chat_dataset, wikisentence_dataset, wikisentence_crypt_dataset],
         [0.5, 0.25, 0.25],
     )
-
-def make_
