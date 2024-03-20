@@ -40,7 +40,7 @@ def main():
         return {"text": f"[LABEL_{labels}]" + row["text"], "labels": labels}
 
     dataset1 = dataset1.map(add_labels_fn, fn_kwargs={"labels": 0})
-    dataset2 = dataset1.map(add_labels_fn, fn_kwargs={"labels": 1})
+    dataset2 = dataset2.map(add_labels_fn, fn_kwargs={"labels": 1})
 
     # Construct final dataset
     dataset = datasets.interleave_datasets([dataset1, dataset2])
