@@ -36,6 +36,8 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
         return_outputs: bool = False,
     ):
         assert self.tokenizer is not None
+        assert self.tokenizer.pad_token_id is not None
+        assert self.tokenizer.unk_token_id is not None
 
         # Enable dropout only in encoder, forming a denoising autoencoder
         model.get_encoder().train()
@@ -56,9 +58,26 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
         # * Decoder: [LABELi_TOKEN] [TEXT_TOKEN_1] ...
         # * Labels: [TEXT_TOKEN_1] ..., masked at encoder [PAD] tokens
 
+        noise_mask = torch.rand_like(input_ids, dtype=torch.float32) < 0.5
+        pad_mask = input_ids != self.tokenizer.pad_token_id
+
+        masked_input_ids = torch.where(
+            torch.logical_and(noise_mask, pad_mask),
+            self.tokenizer.unk_token_id,
+            input_ids,
+        )
+
         # Shift right to make space for the label token, and add it
-        autoencoding_input_ids = torch.roll(input_ids.clone(), 1, dims=1)
+        autoencoding_input_ids = torch.roll(masked_input_ids.clone(), 1, dims=1)
+
         autoencoding_input_ids[:, 0] = torch.where(
+            labels == 0, self.label0_token_id, self.label1_token_id
+        )
+
+        # Shift right to make space for the label token, and add it
+        autoencoding_decoder_input_ids = torch.roll(input_ids.clone(), 1, dims=1)
+
+        autoencoding_decoder_input_ids[:, 0] = torch.where(
             labels == 0, self.label0_token_id, self.label1_token_id
         )
 
@@ -76,7 +95,7 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
         autoencoding_outputs: Seq2SeqLMOutput = model(
             input_ids=autoencoding_input_ids,
             attention_mask=autoencoding_attention_mask,
-            decoder_input_ids=autoencoding_input_ids,
+            decoder_input_ids=autoencoding_decoder_input_ids,
             decoder_attention_mask=autoencoding_attention_mask,
             labels=autoencoding_labels,
         )
