@@ -162,6 +162,7 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
 
         classifier_outputs: Seq2SeqLMOutput = model(
             encoder_outputs=(encoder_last_hidden_state,),
+            attention_mask=autoencoding_attention_mask,
             decoder_input_ids=classifier_input_ids,
             decoder_attention_mask=classifier_attention_mask,
         )
