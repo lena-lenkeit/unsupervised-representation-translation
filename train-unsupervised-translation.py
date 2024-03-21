@@ -36,8 +36,11 @@ def main():
     dataset2 = make_wikisentence_dataset("data/deu_wikipedia_2016_1M-sentences.txt")
 
     # Add labels to datasets
+    # def add_labels_fn(row, *, labels: int):
+    #    return {"text": f"[LABEL_{labels}]" + row["text"], "labels": labels}
+
     def add_labels_fn(row, *, labels: int):
-        return {"text": f"[LABEL_{labels}]" + row["text"], "labels": labels}
+        return {"labels": labels}
 
     dataset1 = dataset1.map(add_labels_fn, fn_kwargs={"labels": 0})
     dataset2 = dataset2.map(add_labels_fn, fn_kwargs={"labels": 1})
