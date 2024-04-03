@@ -18,6 +18,7 @@ from transformers.modeling_outputs import (
 )
 
 import arae.losses as L
+from arae.models import T5ForUnsupervisedTranslation
 from arae.tokens import ARAETokens
 from arae.trainers.common import Mode, TokenIds, exclude_none, sum_default
 
@@ -32,7 +33,9 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
         label0_token_id: int,
         label1_token_id: int,
         cls_token_id: int,
-        use_decoder_as_classifier: bool = True,
+        use_decoder_as_classifier: bool | None = True,
+        model_has_cls_module: bool = False,
+        model_has_cls_head: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -41,10 +44,14 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
         self.label1_token_id = label1_token_id
         self.cls_token_id = cls_token_id
         self.use_decoder_as_classifier = use_decoder_as_classifier
+        self.model_has_cls_module = model_has_cls_module
+        self.model_has_cls_head = model_has_cls_head
 
     def compute_loss(
         self,
-        model: T5ForConditionalGeneration | PreTrainedModel,
+        model: (
+            T5ForUnsupervisedTranslation | T5ForConditionalGeneration | PreTrainedModel
+        ),
         inputs: Dict[str, Any],
         return_outputs: bool = False,
     ):
@@ -233,6 +240,11 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
             encoder_last_hidden_state = autoencoding_outputs.encoder_last_hidden_state
             assert encoder_last_hidden_state is not None
 
+            if self.model_has_cls_module:
+                classifier_module = model.classifier
+            else:
+                classifier_module = model.get_encoder()
+
             num_classifier_steps = 1
             do_encoder_step = self.state.global_step % (num_classifier_steps + 1) == 0
             if do_encoder_step:
@@ -240,8 +252,8 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
                 # label of the latents
                 classifier_labels = 1 - labels
 
-                # Turn off decoder / classifier gradients, to not update D into helping G
-                model.get_encoder().requires_grad_(False)
+                # Turn off classifier gradients, to not update D into helping G
+                classifier_module.requires_grad_(False)
             else:
                 # Keep the same label, so D is trained to predict the correct label of the
                 # latents
@@ -254,7 +266,7 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
                 # the gradients enabled, and here I reuse it for efficiency, instead of
                 # recomputing it with gradients disabled
                 encoder_last_hidden_state = encoder_last_hidden_state.detach()
-                encoder_last_hidden_state.requires_grad_(True)
+                # encoder_last_hidden_state.requires_grad_(True)
 
             # Instance Noise
             # noise_interp = min(1, self.state.global_step / 500)
@@ -269,28 +281,31 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
                 [cls_token_embedding_vector, autoencoder_output_embeddings], dim=1
             )
 
-            classifier_outputs: (
-                BaseModelOutputWithPastAndCrossAttentions
-            ) = model.get_encoder()(
-                inputs_embeds=classifier_input_embeddings,
-                attention_mask=autoencoding_attention_mask,
+            classifier_outputs: BaseModelOutputWithPastAndCrossAttentions = (
+                classifier_module(
+                    inputs_embeds=classifier_input_embeddings,
+                    attention_mask=autoencoding_attention_mask,
+                )
             )
 
-            classifier_logits = model.lm_head(
-                classifier_outputs.last_hidden_state[:, 0]
-            )
+            if self.model_has_cls_head:
+                classifier_logits = model.cls_head(
+                    classifier_outputs.last_hidden_state[:, 0]
+                )[:, 0]
+            else:
+                classifier_logits = model.lm_head(
+                    classifier_outputs.last_hidden_state[:, 0]
+                )
 
-            """
-            classifier_logits = classifier_logits[
-                :, [self.label0_token_id, self.label1_token_id]
-            ]  # Logits of the label tokens
+                classifier_logits = classifier_logits[:, self.cls_token_id]
 
-            classifier_loss = F.cross_entropy(classifier_logits, classifier_labels)
-            """
+                """
+                classifier_logits = classifier_logits[
+                    :, [self.label0_token_id, self.label1_token_id]
+                ]  # Logits of the label tokens
 
-            classifier_logits = classifier_logits[
-                :, self.cls_token_id
-            ]  # Logits of the label tokens
+                classifier_loss = F.cross_entropy(classifier_logits, classifier_labels)
+                """
 
             classifier_loss = F.binary_cross_entropy_with_logits(
                 classifier_logits, classifier_labels.float()
@@ -301,7 +316,7 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
 
             if do_encoder_step:
                 # Turn gradients back on for next training step
-                model.get_encoder().requires_grad_(True)
+                classifier_module.requires_grad_(True)
 
         # Back-translation (for representation consistency across encoding-decoding
         # cycles)

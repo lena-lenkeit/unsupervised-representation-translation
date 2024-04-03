@@ -5,15 +5,16 @@ import torch
 from transformers import T5ForConditionalGeneration, T5Tokenizer, TrainingArguments
 
 from arae.datasets import make_wikisentence_dataset
+from arae.models import T5ForUnsupervisedTranslation
 from arae.trainers import EncoderDecoderLMForUnsupervisedTranslationTrainer
 
 
 def main():
     model_path = "google/flan-t5-small"
     TokenizerType = T5Tokenizer
-    ModelType = T5ForConditionalGeneration
+    ModelType = T5ForUnsupervisedTranslation
 
-    save_dir = "results/flan-t5-small-encdecv2-encoderclassifier"
+    save_dir = "results/flan-t5-small-encdecv2-customt5"
     max_steps = 100000
     per_device_train_batch_size = 32
     learning_rate = 1e-4
@@ -26,6 +27,17 @@ def main():
         model_path, device_map="auto", torch_dtype=torch.float32, dropout_rate=0.1
     )
     assert isinstance(model, ModelType)
+
+    with torch.no_grad():
+        # Init CLS head
+        model.cls_head.weight.normal_(std=0.02)
+
+        # Copy encoder weights to classifier
+        encoder_params = model.encoder.parameters()
+        classifier_params = model.classifier.parameters()
+
+        for enc_p, cls_p in zip(encoder_params, classifier_params):
+            cls_p.copy_(enc_p)
 
     # Add label tokens
     tokenizer.add_tokens(["[LABEL_0]", "[LABEL_1]", "[CLS]"], special_tokens=True)
@@ -74,7 +86,9 @@ def main():
         label0_token_id=tokenizer.convert_tokens_to_ids("[LABEL_0]"),  # type: ignore
         label1_token_id=tokenizer.convert_tokens_to_ids("[LABEL_1]"),  # type: ignore
         cls_token_id=tokenizer.convert_tokens_to_ids("[CLS]"),  # type: ignore
-        use_decoder_as_classifier=False,
+        use_decoder_as_classifier=None,
+        model_has_cls_module=True,
+        model_has_cls_head=True,
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
