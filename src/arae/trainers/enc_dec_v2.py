@@ -12,7 +12,10 @@ from transformers import (
     T5ForConditionalGeneration,
     Trainer,
 )
-from transformers.modeling_outputs import Seq2SeqLMOutput
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPastAndCrossAttentions,
+    Seq2SeqLMOutput,
+)
 
 import arae.losses as L
 from arae.tokens import ARAETokens
@@ -23,11 +26,21 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
     """Trainer for encoder-decoder language models to perform unsupervised
     translation"""
 
-    def __init__(self, *, label0_token_id: int, label1_token_id: int, **kwargs):
+    def __init__(
+        self,
+        *,
+        label0_token_id: int,
+        label1_token_id: int,
+        cls_token_id: int,
+        use_decoder_as_classifier: bool = True,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
 
         self.label0_token_id = label0_token_id
         self.label1_token_id = label1_token_id
+        self.cls_token_id = cls_token_id
+        self.use_decoder_as_classifier = use_decoder_as_classifier
 
     def compute_loss(
         self,
@@ -40,8 +53,8 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
         assert self.tokenizer.unk_token_id is not None
 
         # Enable dropout only in encoder, forming a denoising autoencoder
-        model.get_encoder().train()
-        model.get_decoder().eval()
+        # model.get_encoder().train()
+        # model.get_decoder().eval()
 
         # Retrieve base inputs from batch
         # * (encoder_)input_ids should be [TEXT_TOKEN_1] ...
@@ -100,6 +113,10 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
             labels=autoencoding_labels,
         )
 
+        # print(autoencoding_input_ids)
+        # print(autoencoding_decoder_input_ids)
+        # print(input_ids)
+
         autoencoding_loss = autoencoding_outputs.loss
         assert autoencoding_loss is not None
 
@@ -111,107 +128,187 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
 
         batch_size = input_ids.shape[0]
 
-        # For T5, the decoder start token is the pad token
-        assert self.tokenizer is not None
-        decoder_start_token_id = self.tokenizer.pad_token_id
+        if self.use_decoder_as_classifier:
+            # For T5, the decoder start token is the pad token
+            decoder_start_token_id = self.tokenizer.pad_token_id
 
-        # Construct inputs for the decoder needed to perform classification. Here, this
-        # is the decoder start token as input, and the loss is computed from the logits
-        # of the next predicted token
-        classifier_input_ids = [[decoder_start_token_id]] * batch_size
-        classifier_input_ids = torch.LongTensor(classifier_input_ids).to(
-            input_ids.device
-        )
+            # Construct inputs for the decoder needed to perform classification. Here, this
+            # is the decoder start token as input, and the loss is computed from the logits
+            # of the next predicted token
+            classifier_input_ids = [[decoder_start_token_id]] * batch_size
+            classifier_input_ids = torch.LongTensor(classifier_input_ids).to(
+                input_ids.device
+            )
 
-        classifier_attention_mask = [[1]] * batch_size
-        classifier_attention_mask = torch.LongTensor(classifier_attention_mask).to(
-            input_ids.device
-        )
+            classifier_attention_mask = [[1]] * batch_size
+            classifier_attention_mask = torch.LongTensor(classifier_attention_mask).to(
+                input_ids.device
+            )
 
-        encoder_last_hidden_state = autoencoding_outputs.encoder_last_hidden_state
-        assert encoder_last_hidden_state is not None
+            encoder_last_hidden_state = autoencoding_outputs.encoder_last_hidden_state
+            assert encoder_last_hidden_state is not None
 
-        num_classifier_steps = 1
-        do_encoder_step = self.state.global_step % (num_classifier_steps + 1) == 0
-        if do_encoder_step:
-            # Invert the label, so that G is trained to fool D into predicting the wrong
-            # label of the latents
-            classifier_labels = 1 - labels
+            num_classifier_steps = 1
+            do_encoder_step = self.state.global_step % (num_classifier_steps + 1) == 0
+            if do_encoder_step:
+                # Invert the label, so that G is trained to fool D into predicting the wrong
+                # label of the latents
+                classifier_labels = 1 - labels
 
-            # Turn off decoder / classifier gradients, to not update D into helping G
-            model.get_decoder().requires_grad_(False)
+                # Turn off decoder / classifier gradients, to not update D into helping G
+                model.get_decoder().requires_grad_(False)
+            else:
+                # Keep the same label, so D is trained to predict the correct label of the
+                # latents
+                classifier_labels = labels
+
+                # Turn off encoder gradients (by preventing backpropagation into the
+                # encoder), to not update G into helping D
+                # * Setting model.get_encoder().requires_grad_(False), as above for the
+                # decoder, would not work, since encoder_last_hidden_state was computed with
+                # the gradients enabled, and here I reuse it for efficiency, instead of
+                # recomputing it with gradients disabled
+                encoder_last_hidden_state = encoder_last_hidden_state.detach()
+                encoder_last_hidden_state.requires_grad_(True)
+
+            # Instance Noise
+            # noise_interp = min(1, self.state.global_step / 500)
+            # encoder_last_hidden_state = noise_interp * encoder_last_hidden_state + (
+            #    1 - noise_interp
+            # ) * torch.randn_like(encoder_last_hidden_state)
+
+            classifier_outputs: Seq2SeqLMOutput = model(
+                encoder_outputs=(encoder_last_hidden_state,),
+                attention_mask=autoencoding_attention_mask,
+                decoder_input_ids=classifier_input_ids,
+                decoder_attention_mask=classifier_attention_mask,
+            )
+
+            classifier_logits = classifier_outputs.logits[
+                :, 0, [self.label0_token_id, self.label1_token_id]
+            ]  # Logits of the label tokens, at the first decoder token position
+
+            classifier_loss = F.cross_entropy(classifier_logits, classifier_labels)
+
+            # Gradient penality
+            gradient_penalty = torch.tensor(0.0, dtype=torch.float32)
+            # if not do_encoder_step:
+            if False:
+                classifier_binary_prob = F.softmax(classifier_logits, dim=1)
+                # classifier_binary_prob = classifier_logits
+
+                classifier_binary_prob = torch.where(
+                    classifier_labels == 1,
+                    classifier_binary_prob[:, 1],
+                    classifier_binary_prob[:, 0],
+                )
+
+                # classifier_binary_prob = classifier_binary_prob[::2]
+                # classifier_labels = classifier_labels[::2]
+
+                classifier_grads = torch.autograd.grad(
+                    outputs=classifier_binary_prob,
+                    inputs=encoder_last_hidden_state,
+                    grad_outputs=torch.ones_like(classifier_binary_prob),
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True,
+                )[0]
+
+                # print(classifier_labels)
+
+                gradient_penalty = torch.mean(
+                    torch.square(classifier_grads.norm(p=2, dim=(1, 2)))
+                )
+
+            if do_encoder_step:
+                # Turn gradients back on for next training step
+                model.get_decoder().requires_grad_(True)
         else:
-            # Keep the same label, so D is trained to predict the correct label of the
-            # latents
-            classifier_labels = labels
+            embedding_layer = model.shared
+            cls_token_id_tensor = torch.LongTensor([[self.cls_token_id]] * batch_size)
+            cls_token_id_tensor = cls_token_id_tensor.to(model.device)
+            cls_token_embedding_vector = embedding_layer(cls_token_id_tensor)
 
-            # Turn off encoder gradients (by preventing backpropagation into the
-            # encoder), to not update G into helping D
-            # * Setting model.get_encoder().requires_grad_(False), as above for the
-            # decoder, would not work, since encoder_last_hidden_state was computed with
-            # the gradients enabled, and here I reuse it for efficiency, instead of
-            # recomputing it with gradients disabled
-            encoder_last_hidden_state = encoder_last_hidden_state.detach()
-            encoder_last_hidden_state.requires_grad_(True)
+            encoder_last_hidden_state = autoencoding_outputs.encoder_last_hidden_state
+            assert encoder_last_hidden_state is not None
 
-        # Instance Noise
-        # noise_interp = min(1, self.state.global_step / 500)
-        # encoder_last_hidden_state = noise_interp * encoder_last_hidden_state + (
-        #    1 - noise_interp
-        # ) * torch.randn_like(encoder_last_hidden_state)
+            num_classifier_steps = 1
+            do_encoder_step = self.state.global_step % (num_classifier_steps + 1) == 0
+            if do_encoder_step:
+                # Invert the label, so that G is trained to fool D into predicting the wrong
+                # label of the latents
+                classifier_labels = 1 - labels
 
-        classifier_outputs: Seq2SeqLMOutput = model(
-            encoder_outputs=(encoder_last_hidden_state,),
-            attention_mask=autoencoding_attention_mask,
-            decoder_input_ids=classifier_input_ids,
-            decoder_attention_mask=classifier_attention_mask,
-        )
+                # Turn off decoder / classifier gradients, to not update D into helping G
+                model.get_encoder().requires_grad_(False)
+            else:
+                # Keep the same label, so D is trained to predict the correct label of the
+                # latents
+                classifier_labels = labels
 
-        classifier_logits = classifier_outputs.logits[
-            :, 0, [self.label0_token_id, self.label1_token_id]
-        ]  # Logits of the label tokens, at the first decoder token position
+                # Turn off encoder gradients (by preventing backpropagation into the
+                # encoder), to not update G into helping D
+                # * Setting model.get_encoder().requires_grad_(False), as above for the
+                # decoder, would not work, since encoder_last_hidden_state was computed with
+                # the gradients enabled, and here I reuse it for efficiency, instead of
+                # recomputing it with gradients disabled
+                encoder_last_hidden_state = encoder_last_hidden_state.detach()
+                encoder_last_hidden_state.requires_grad_(True)
 
-        classifier_loss = F.cross_entropy(classifier_logits, classifier_labels)
+            # Instance Noise
+            # noise_interp = min(1, self.state.global_step / 500)
+            # encoder_last_hidden_state = noise_interp * encoder_last_hidden_state + (
+            #    1 - noise_interp
+            # ) * torch.randn_like(encoder_last_hidden_state)
 
-        # Gradient penality
-        gradient_penalty = 0.0
-        if not do_encoder_step:
-            classifier_binary_prob = F.softmax(classifier_logits, dim=1)
-            # classifier_binary_prob = classifier_logits
+            autoencoder_output_embeddings = encoder_last_hidden_state[:, 1:]
+            classifier_attention_mask = autoencoding_attention_mask
 
-            classifier_binary_prob = torch.where(
-                classifier_labels == 1,
-                classifier_binary_prob[:, 1],
-                classifier_binary_prob[:, 0],
+            classifier_input_embeddings = torch.cat(
+                [cls_token_embedding_vector, autoencoder_output_embeddings], dim=1
             )
 
-            # classifier_binary_prob = classifier_binary_prob[::2]
-            # classifier_labels = classifier_labels[::2]
-
-            classifier_grads = torch.autograd.grad(
-                outputs=classifier_binary_prob,
-                inputs=encoder_last_hidden_state,
-                grad_outputs=torch.ones_like(classifier_binary_prob),
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True,
-            )[0]
-
-            print(classifier_labels)
-
-            gradient_penalty = torch.mean(
-                torch.square(classifier_grads.norm(p=2, dim=(1, 2)))
+            classifier_outputs: (
+                BaseModelOutputWithPastAndCrossAttentions
+            ) = model.get_encoder()(
+                inputs_embeds=classifier_input_embeddings,
+                attention_mask=autoencoding_attention_mask,
             )
 
-        if do_encoder_step:
-            # Turn gradients back on for next training step
-            model.get_decoder().requires_grad_(True)
+            classifier_logits = model.lm_head(
+                classifier_outputs.last_hidden_state[:, 0]
+            )
+
+            """
+            classifier_logits = classifier_logits[
+                :, [self.label0_token_id, self.label1_token_id]
+            ]  # Logits of the label tokens
+
+            classifier_loss = F.cross_entropy(classifier_logits, classifier_labels)
+            """
+
+            classifier_logits = classifier_logits[
+                :, self.cls_token_id
+            ]  # Logits of the label tokens
+
+            classifier_loss = F.binary_cross_entropy_with_logits(
+                classifier_logits, classifier_labels.float()
+            )
+
+            # Gradient penality
+            gradient_penalty = torch.tensor(0.0, dtype=torch.float32)
+
+            if do_encoder_step:
+                # Turn gradients back on for next training step
+                model.get_encoder().requires_grad_(True)
 
         # Back-translation (for representation consistency across encoding-decoding
         # cycles)
         # TODO: Implement this
 
-        do_log_step = self.state.global_step % self.state.logging_steps == 0
+        # do_log_step = self.state.global_step % self.state.logging_steps == 0
+        do_log_step = True
         if do_log_step:
             classifier_loss_name = "Encoder" if do_encoder_step else "Classifier"
             classifier_loss_name = classifier_loss_name + " Loss"
@@ -219,12 +316,12 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
             self.log_metrics(
                 split="train",
                 metrics={
-                    "Autoencoder Loss": autoencoding_loss,
-                    classifier_loss_name: classifier_loss,
+                    "Autoencoder Loss": f"{autoencoding_loss.item():.2e}",
+                    classifier_loss_name: f"{classifier_loss.item():.2e}",
                     # "Instance Noise": 1 - noise_interp,
-                    "Gradient Penalty": gradient_penalty,
+                    "Gradient Penalty": f"{gradient_penalty.item():.2e}",
                 },
             )
 
-        loss = autoencoding_loss + classifier_loss * 5 + gradient_penalty * 50
+        loss = autoencoding_loss + classifier_loss * 1  # + gradient_penalty * 10
         return loss

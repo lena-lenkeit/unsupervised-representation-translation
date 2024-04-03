@@ -13,7 +13,7 @@ def main():
     TokenizerType = T5Tokenizer
     ModelType = T5ForConditionalGeneration
 
-    save_dir = "results/flan-t5-small-encdecv2"
+    save_dir = "results/flan-t5-small-encdecv2-encoderclassifier"
     max_steps = 100000
     per_device_train_batch_size = 32
     learning_rate = 1e-4
@@ -28,7 +28,7 @@ def main():
     assert isinstance(model, ModelType)
 
     # Add label tokens
-    tokenizer.add_tokens(["[LABEL_0]", "[LABEL_1]"], special_tokens=True)
+    tokenizer.add_tokens(["[LABEL_0]", "[LABEL_1]", "[CLS]"], special_tokens=True)
     model.resize_token_embeddings(len(tokenizer))
 
     # Load datasets
@@ -73,6 +73,8 @@ def main():
     trainer = EncoderDecoderLMForUnsupervisedTranslationTrainer(
         label0_token_id=tokenizer.convert_tokens_to_ids("[LABEL_0]"),  # type: ignore
         label1_token_id=tokenizer.convert_tokens_to_ids("[LABEL_1]"),  # type: ignore
+        cls_token_id=tokenizer.convert_tokens_to_ids("[CLS]"),  # type: ignore
+        use_decoder_as_classifier=False,
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
