@@ -2,11 +2,20 @@ import functools
 
 import datasets
 import torch
-from transformers import T5ForConditionalGeneration, T5Tokenizer, TrainingArguments
+from torch.utils.data import DataLoader
+from transformers import (
+    DataCollatorWithPadding,
+    T5ForConditionalGeneration,
+    T5Tokenizer,
+    TrainingArguments,
+)
 
 from arae.datasets import make_wikisentence_dataset
 from arae.models import T5ForUnsupervisedTranslation
-from arae.trainers import EncoderDecoderLMForUnsupervisedTranslationTrainer
+from arae.trainers import (
+    EncoderDecoderLMForUnsupervisedTranslationTrainer,
+    utl_model_training_loop,
+)
 
 
 def main():
@@ -16,7 +25,7 @@ def main():
 
     save_dir = "results/flan-t5-small-encdecv2-customt5"
     max_steps = 100000
-    per_device_train_batch_size = 32
+    per_device_train_batch_size = 1
     learning_rate = 1e-4
 
     # Load model and tokenizer
@@ -28,19 +37,26 @@ def main():
     )
     assert isinstance(model, ModelType)
 
-    with torch.no_grad():
-        # Init CLS head
-        model.cls_head.weight.normal_(std=0.02)
+    if ModelType == T5ForUnsupervisedTranslation:
+        with torch.no_grad():
+            # Init CLS head
+            model.cls_head.weight.normal_(std=0.02)
 
-        # Copy encoder weights to classifier
-        encoder_params = model.encoder.parameters()
-        classifier_params = model.classifier.parameters()
+            # Copy encoder weights to classifier
+            encoder_params = model.encoder.parameters()
+            classifier_params = model.classifier.parameters()
 
-        for enc_p, cls_p in zip(encoder_params, classifier_params):
-            cls_p.copy_(enc_p)
+            for enc_p, cls_p in zip(encoder_params, classifier_params):
+                cls_p.copy_(enc_p)
+
+        # model.gradient_checkpointing_enable(
+        #    {"use_reentrant": True}
+        # )  # False doesn't work
 
     # Add label tokens
-    tokenizer.add_tokens(["[LABEL_0]", "[LABEL_1]", "[CLS]"], special_tokens=True)
+    tokenizer.add_tokens(
+        ["[LABEL_0]", "[LABEL_1]", "[CLS]", "[MASK]"], special_tokens=True
+    )
     model.resize_token_embeddings(len(tokenizer))
 
     # Load datasets
@@ -65,37 +81,58 @@ def main():
     dataset = dataset.select_columns(["input_ids", "attention_mask", "labels"])
 
     # Define training arguments
-    training_args = TrainingArguments(
-        output_dir=save_dir,
-        max_steps=max_steps,
-        per_device_train_batch_size=per_device_train_batch_size,
-        learning_rate=learning_rate,
-        lr_scheduler_type="constant",
-        warmup_steps=0,
-        save_total_limit=1,
-        save_steps=100,
-        logging_steps=10,
-        logging_first_step=True,
-        gradient_checkpointing=True,
-        weight_decay=0.0,
-        optim="adamw_bnb_8bit",
-        remove_unused_columns=False,
-    )
+    if ModelType == T5ForUnsupervisedTranslation:
+        data_collator = DataCollatorWithPadding(tokenizer, max_length=64)
+        train_dataloader = DataLoader(
+            dataset, batch_size=per_device_train_batch_size, collate_fn=data_collator
+        )
 
-    trainer = EncoderDecoderLMForUnsupervisedTranslationTrainer(
-        label0_token_id=tokenizer.convert_tokens_to_ids("[LABEL_0]"),  # type: ignore
-        label1_token_id=tokenizer.convert_tokens_to_ids("[LABEL_1]"),  # type: ignore
-        cls_token_id=tokenizer.convert_tokens_to_ids("[CLS]"),  # type: ignore
-        use_decoder_as_classifier=None,
-        model_has_cls_module=True,
-        model_has_cls_head=True,
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=dataset,
-        args=training_args,
-    )
+        utl_model_training_loop(
+            model,
+            tokenizer,
+            train_dataloader,
+            100000,
+            learning_rate,
+            1e-2,
+            tokenizer.pad_token_id,
+            tokenizer.convert_tokens_to_ids("[LABEL_0]"),
+            tokenizer.convert_tokens_to_ids("[LABEL_1]"),
+            tokenizer.convert_tokens_to_ids("[MASK]"),
+            tokenizer.convert_tokens_to_ids("[CLS]"),
+            save_dir=save_dir,
+        )
+    else:
+        training_args = TrainingArguments(
+            output_dir=save_dir,
+            max_steps=max_steps,
+            per_device_train_batch_size=per_device_train_batch_size,
+            learning_rate=learning_rate,
+            lr_scheduler_type="constant",
+            warmup_steps=0,
+            save_total_limit=1,
+            save_steps=100,
+            logging_steps=10,
+            logging_first_step=True,
+            gradient_checkpointing=True,
+            weight_decay=0.0,
+            optim="adamw_bnb_8bit",
+            remove_unused_columns=False,
+        )
 
-    trainer.train()
+        trainer = EncoderDecoderLMForUnsupervisedTranslationTrainer(
+            label0_token_id=tokenizer.convert_tokens_to_ids("[LABEL_0]"),  # type: ignore
+            label1_token_id=tokenizer.convert_tokens_to_ids("[LABEL_1]"),  # type: ignore
+            cls_token_id=tokenizer.convert_tokens_to_ids("[CLS]"),  # type: ignore
+            use_decoder_as_classifier=None,
+            model_has_cls_module=True,
+            model_has_cls_head=True,
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=dataset,
+            args=training_args,
+        )
+
+        trainer.train()
 
 
 if __name__ == "__main__":

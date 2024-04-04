@@ -1,11 +1,28 @@
+import itertools
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Dict, Mapping, NamedTuple, Optional, TypedDict, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Tuple,
+    TypedDict,
+    Union,
+)
 
+import bitsandbytes as bnb
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from dacite import from_dict
 from jaxtyping import Float, Int64
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm as tq
+from tqdm.auto import trange
 from transformers import (
     PreTrainedModel,
     Seq2SeqTrainer,
@@ -15,6 +32,7 @@ from transformers import (
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     Seq2SeqLMOutput,
+    SequenceClassifierOutput,
 )
 
 import arae.losses as L
@@ -340,3 +358,295 @@ class EncoderDecoderLMForUnsupervisedTranslationTrainer(Trainer):
 
         loss = autoencoding_loss + classifier_loss * 1  # + gradient_penalty * 10
         return loss
+
+
+def filter_weight_decay(named_params: Iterable[Tuple[str, nn.Parameter]]):
+    with_weight_decay: List[Tuple[str, nn.Parameter]] = []
+    without_weight_decay: List[Tuple[str, nn.Parameter]] = []
+
+    for n, p in named_params:
+        apply_weight_decay = True
+
+        # No weight decay for all bias terms
+        if n.endswith(".bias"):
+            apply_weight_decay = False
+
+        # No weight decay for all layer norms
+        if "layer_norm" in n:
+            apply_weight_decay = False
+
+        if apply_weight_decay:
+            with_weight_decay.append(p)
+        else:
+            without_weight_decay.append(p)
+
+    return with_weight_decay, without_weight_decay
+
+
+def make_param_groups(
+    named_params: Iterable[Tuple[str, nn.Parameter]],
+    learning_rate: float,
+    weight_decay: float,
+):
+    with_weight_decay, without_weight_decay = filter_weight_decay(named_params)
+
+    base_group = {
+        "params": with_weight_decay,
+        "lr": learning_rate,
+        "weight_decay": weight_decay,
+    }
+
+    no_wd_group = {
+        "params": without_weight_decay,
+        "lr": learning_rate,
+        "weight_decay": 0.0,
+    }
+
+    return [base_group, no_wd_group]
+
+
+def utl_autoencode(
+    model: T5ForUnsupervisedTranslation,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    pad_token_id: int,
+    label0_token_id: int,
+    label1_token_id: int,
+    mask_token_id: int,
+):
+    # Generate input id mask
+    noise_mask = torch.rand_like(input_ids, dtype=torch.float32) < -0.5
+    pad_mask = input_ids != pad_token_id
+
+    # Mask input ids
+    masked_input_ids = torch.where(
+        torch.logical_and(noise_mask, pad_mask),
+        mask_token_id,
+        input_ids,
+    )
+
+    # Create autoencoder inputs
+    autoencoder_input_ids = torch.roll(masked_input_ids.clone(), 1, dims=1)
+    autoencoder_input_ids[:, 0] = torch.where(
+        labels == 0, label0_token_id, label1_token_id
+    )
+
+    autoencoder_decoder_input_ids = torch.roll(input_ids.clone(), 1, dims=1)
+    autoencoder_decoder_input_ids[:, 0] = torch.where(
+        labels == 0, label0_token_id, label1_token_id
+    )
+
+    autoencoder_attention_mask = torch.roll(attention_mask.clone(), 1, dims=1)
+    autoencoder_attention_mask[:, 0] = 1
+
+    # Ignore decoder labels at padding tokens
+    autoencoder_labels = torch.where(
+        autoencoder_input_ids == pad_token_id,
+        -100,
+        input_ids.clone(),
+    )
+
+    autoencoder_output: Seq2SeqLMOutput = model(
+        input_ids=autoencoder_input_ids,
+        attention_mask=autoencoder_attention_mask,
+        decoder_input_ids=autoencoder_decoder_input_ids,
+        decoder_attention_mask=autoencoder_attention_mask,
+        labels=autoencoder_labels,
+    )
+
+    return autoencoder_output, autoencoder_attention_mask
+
+
+def utl_classifier(
+    model: T5ForUnsupervisedTranslation,
+    encoder_embeds: torch.Tensor,
+    encoder_attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+):
+    classifier_outputs = model.classifier(
+        inputs_embeds=encoder_embeds, attention_mask=encoder_attention_mask
+    )
+    classifier_pooled = classifier_outputs.last_hidden_state
+    classifier_pooled = torch.mean(classifier_pooled, dim=1)
+    classifier_logits = model.cls_head(classifier_pooled)[:, 0]
+
+    classifier_loss = F.binary_cross_entropy_with_logits(
+        classifier_logits, labels.float()
+    )
+
+    return SequenceClassifierOutput(loss=classifier_loss, logits=classifier_logits)  # type: ignore
+
+
+def utl_model_training_loop(
+    model: T5ForUnsupervisedTranslation,
+    tokenizer,
+    train_dataloader: DataLoader,
+    num_steps: int,
+    learning_rate: float,
+    weight_decay: float,
+    pad_token_id: int,
+    label0_token_id: int,
+    label1_token_id: int,
+    mask_token_id: int,
+    cls_token_id: int,
+    save_dir: str,
+):
+    OptimizerClass = bnb.optim.adamw.AdamW8bit
+    device = model.device
+
+    autoencoder_params = itertools.chain(
+        model.encoder.named_parameters(),
+        model.decoder.named_parameters(),
+        model.lm_head.named_parameters(),
+        model.shared.named_parameters(),
+    )
+
+    encoder_params = itertools.chain(
+        model.encoder.named_parameters(),
+        model.shared.named_parameters(),
+    )
+
+    classifier_params = itertools.chain(
+        model.classifier.named_parameters(),
+        model.shared.named_parameters(),
+    )
+
+    autoencoder_optimizer = OptimizerClass(
+        make_param_groups(autoencoder_params, learning_rate, weight_decay)
+    )
+
+    encoder_optimizer = OptimizerClass(
+        make_param_groups(encoder_params, learning_rate, weight_decay)
+    )
+
+    classifier_optimizer = OptimizerClass(
+        make_param_groups(classifier_params, learning_rate, weight_decay)
+    )
+
+    model.train()
+
+    pbar = tq(enumerate(train_dataloader))
+    for step, batch in pbar:
+        input_ids: torch.Tensor = batch["input_ids"].to(device)
+        attention_mask: torch.Tensor = batch["attention_mask"].to(device)
+        labels: torch.Tensor = batch["labels"].to(device)
+
+        # print(input_ids.shape)
+
+        # Autoencoder Step
+        autoencoder_output, _ = utl_autoencode(
+            model,
+            input_ids,
+            attention_mask,
+            labels,
+            pad_token_id,
+            label0_token_id,
+            label1_token_id,
+            mask_token_id,
+        )
+
+        autoencoder1_loss = autoencoder_output.loss
+        assert autoencoder1_loss is not None
+
+        autoencoder_optimizer.zero_grad(set_to_none=True)
+        autoencoder1_loss.backward()
+        autoencoder_optimizer.step()
+
+        # Classifier Step
+        # with torch.no_grad():
+        autoencoder_output, encoder_attention_mask = utl_autoencode(
+            model,
+            input_ids,
+            attention_mask,
+            labels,
+            pad_token_id,
+            label0_token_id,
+            label1_token_id,
+            mask_token_id,
+        )
+
+        assert autoencoder_output.encoder_last_hidden_state is not None
+
+        classifier_output = utl_classifier(
+            model,
+            autoencoder_output.encoder_last_hidden_state,
+            encoder_attention_mask,
+            torch.zeros_like(labels),
+        )
+
+        classifier_loss = classifier_output.loss
+        assert classifier_loss is not None
+
+        classifier_optimizer.zero_grad(set_to_none=True)
+        classifier_loss.backward()
+        print(
+            torch.nn.utils.clip_grad.clip_grad_norm_(
+                classifier_optimizer.param_groups[0]["params"], max_norm=10000
+            )
+        )
+        classifier_optimizer.step()
+
+        # Autoencoder Step
+        autoencoder_output, _ = utl_autoencode(
+            model,
+            input_ids,
+            attention_mask,
+            labels,
+            pad_token_id,
+            label0_token_id,
+            label1_token_id,
+            mask_token_id,
+        )
+
+        autoencoder2_loss = autoencoder_output.loss
+        assert autoencoder2_loss is not None
+
+        autoencoder_optimizer.zero_grad(set_to_none=True)
+        autoencoder2_loss.backward()
+        autoencoder_optimizer.step()
+
+        # Adversarial Encoder Step
+        """
+        autoencoder_output, encoder_attention_mask = utl_autoencode(
+            model,
+            input_ids,
+            attention_mask,
+            labels,
+            pad_token_id,
+            label0_token_id,
+            label1_token_id,
+            mask_token_id,
+        )
+
+        assert autoencoder_output.encoder_last_hidden_state is not None
+
+        model.classifier.requires_grad_(False)
+        model.cls_head.requires_grad_(False)
+
+        classifier_output = utl_classifier(
+            model,
+            autoencoder_output.encoder_last_hidden_state,
+            encoder_attention_mask,
+            1 - labels,
+        )
+
+        model.classifier.requires_grad_(True)
+        model.cls_head.requires_grad_(True)
+
+        adversarial_loss = classifier_output.loss
+        assert adversarial_loss is not None
+
+        encoder_optimizer.zero_grad(set_to_none=True)
+        adversarial_loss.backward()
+        encoder_optimizer.step()
+        """
+        adversarial_loss = 0.0
+
+        if (step + 1) % 100 == 0:
+            model.save_pretrained(save_dir)
+            tokenizer.save_pretrained(save_dir)
+
+        pbar.set_postfix_str(
+            f"AE1: {autoencoder1_loss:.2e} AE2: {autoencoder2_loss:.2e} CLS: {classifier_loss:.2e} ADV: {adversarial_loss:.2e}"
+        )
