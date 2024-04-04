@@ -172,10 +172,12 @@ def main_dictionary_learning_single_token_ff():
 
         autoencoder_loss = F.cross_entropy(batch_reconstructions, batch_tokens)
 
-        ## Adversarial loss
-        batch_token_embeddings = token_embeddings(batch_tokens)
-        batch_latents = encoder(batch_token_embeddings)
+        autoencoder_optimizer.zero_grad(set_to_none=True)
+        autoencoder_loss.backward()
+        autoencoder_optimizer.step()
 
+        """
+        ## Adversarial loss
         classifier.requires_grad_(False)
         batch_pred_classes = classifier(batch_latents)
         classifier.requires_grad_(True)
@@ -205,6 +207,10 @@ def main_dictionary_learning_single_token_ff():
         classifier_optimizer.zero_grad(set_to_none=True)
         classifier_loss.backward()
         classifier_optimizer.step()
+        """
+
+        classifier_loss = 0
+        adversarial_loss = 0
 
         pbar.set_postfix_str(
             f"AE {autoencoder_loss:.2e} CLS {classifier_loss:.2e} ADV {adversarial_loss:.2e}"
