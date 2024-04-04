@@ -137,14 +137,10 @@ def main_dictionary_learning_single_token_ff():
         token_embeddings.parameters(),
         encoder.parameters(),
     )
-    encoder_params = encoder.parameters()
     classifier_params = classifier.parameters()
 
     autoencoder_optimizer = optim.AdamW(
         autoencoder_params, lr=learning_rate, weight_decay=weight_decay
-    )
-    encoder_optimizer = optim.AdamW(
-        encoder_params, lr=learning_rate, weight_decay=weight_decay
     )
     classifier_optimizer = optim.AdamW(
         classifier_params, lr=learning_rate, weight_decay=weight_decay
@@ -161,7 +157,7 @@ def main_dictionary_learning_single_token_ff():
         ## Shift tokens to match their respective language
         batch_tokens = batch_tokens + batch_languages * num_tokens_per_language
 
-        # Calculate losses
+        # Step Autoencoder
 
         ## Autoencoder loss
         batch_token_embeddings = token_embeddings(batch_tokens)
@@ -170,9 +166,25 @@ def main_dictionary_learning_single_token_ff():
 
         autoencoder_loss = F.cross_entropy(batch_reconstructions, batch_tokens)
 
+        ## Adversarial loss
+        batch_token_embeddings = token_embeddings(batch_tokens)
+        batch_latents = encoder(batch_token_embeddings)
+
+        classifier.requires_grad_(False)
+        batch_pred_classes = classifier(batch_latents)
+        classifier.requires_grad_(True)
+
+        adversarial_loss = F.binary_cross_entropy_with_logits(
+            batch_pred_classes[:, 0], 1 - batch_languages.float()
+        )
+
+        loss = autoencoder_loss + adversarial_loss
+
         autoencoder_optimizer.zero_grad(set_to_none=True)
-        autoencoder_loss.backward()
+        loss.backward()
         autoencoder_optimizer.step()
+
+        # Step classifier
 
         ## Classifier loss
         with torch.no_grad():
@@ -188,24 +200,8 @@ def main_dictionary_learning_single_token_ff():
         classifier_loss.backward()
         classifier_optimizer.step()
 
-        ## Adversarial Encoder loss
-        batch_token_embeddings = token_embeddings(batch_tokens)
-        batch_latents = encoder(batch_token_embeddings)
-
-        classifier.requires_grad_(False)
-        batch_pred_classes = classifier(batch_latents)
-        classifier.requires_grad_(True)
-
-        adv_encoder_loss = F.binary_cross_entropy_with_logits(
-            batch_pred_classes[:, 0], 1 - batch_languages.float()
-        )
-
-        encoder_optimizer.zero_grad(set_to_none=True)
-        adv_encoder_loss.backward()
-        encoder_optimizer.step()
-
         pbar.set_postfix_str(
-            f"AE {autoencoder_loss:.2e} CLS {classifier_loss:.2e} ADV {adv_encoder_loss:.2e}"
+            f"AE {autoencoder_loss:.2e} CLS {classifier_loss:.2e} ADV {adversarial_loss:.2e}"
         )
 
 
