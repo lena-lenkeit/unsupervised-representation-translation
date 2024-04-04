@@ -111,6 +111,7 @@ def main_dictionary_learning_single_token_ff():
 
     # Build networks
     token_embeddings = nn.Embedding(num_tokens_per_language * 2, embedding_size)
+    language_embeddings = nn.Embedding(2, embedding_size)
 
     encoder = FeedForwardNetwork(
         embedding_size,
@@ -121,7 +122,7 @@ def main_dictionary_learning_single_token_ff():
     )
 
     decoder = FeedForwardNetwork(
-        latent_size,
+        embedding_size + latent_size,
         num_tokens_per_language * 2,
         hidden_size,
         hidden_layers,
@@ -135,6 +136,7 @@ def main_dictionary_learning_single_token_ff():
     # Make optimizers
     autoencoder_params = itertools.chain(
         token_embeddings.parameters(),
+        language_embeddings.parameters(),
         encoder.parameters(),
     )
     classifier_params = classifier.parameters()
@@ -161,8 +163,12 @@ def main_dictionary_learning_single_token_ff():
 
         ## Autoencoder loss
         batch_token_embeddings = token_embeddings(batch_tokens)
+        batch_language_embeddings = language_embeddings(batch_languages)
+
         batch_latents = encoder(batch_token_embeddings)
-        batch_reconstructions = decoder(batch_latents)
+
+        decoder_inputs = torch.cat((batch_language_embeddings, batch_latents), dim=1)
+        batch_reconstructions = decoder(decoder_inputs)
 
         autoencoder_loss = F.cross_entropy(batch_reconstructions, batch_tokens)
 
