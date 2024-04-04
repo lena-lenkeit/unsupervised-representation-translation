@@ -87,7 +87,7 @@ def main():
         per_device_train_batch_size=16,
         lr_scheduler_type="constant",
         gradient_checkpointing=True,
-        optim="adafactor",
+        optim="adamw_bnb_8bit",
     )
 
     dataset = make_instruct_translate_dataset(
