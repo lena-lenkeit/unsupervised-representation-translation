@@ -10,16 +10,21 @@ from transformers import (
 )
 
 from arae.datasets import make_wikisentence_dataset
+from arae.models import T5ForUnsupervisedTranslation
 from arae.trainers import EncoderDecoderLMForUnsupervisedTranslationTrainer
 
 
 def main():
-    model_path = "results/flan-t5-small-encdecv2-encoderclassifier/checkpoint-1300"
+    model_path = "results/flan-t5-small-encdecv2-custom5-customloop"
     TokenizerType = T5Tokenizer
-    ModelType = T5ForConditionalGeneration
+    ModelType = T5ForUnsupervisedTranslation
 
     # Load model and tokenizer
-    tokenizer = TokenizerType.from_pretrained(model_path)
+    # tokenizer = TokenizerType.from_pretrained(model_path)
+    tokenizer = TokenizerType.from_pretrained("google/flan-t5-small")
+    tokenizer.add_tokens(
+        ["[LABEL_0]", "[LABEL_1]", "[CLS]", "[MASK]"], special_tokens=True
+    )
     assert isinstance(tokenizer, TokenizerType)
 
     model = ModelType.from_pretrained(
@@ -29,7 +34,7 @@ def main():
 
     print(tokenizer.convert_tokens_to_ids("[LABEL_0]"))
 
-    # model.get_encoder().train()
+    model.train()
 
     while True:
         text_input = input("Encoder Input Text: ")
