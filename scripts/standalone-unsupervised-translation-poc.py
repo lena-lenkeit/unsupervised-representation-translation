@@ -4,6 +4,7 @@ for Unsupervised Translation"""
 import itertools
 from typing import Callable
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -80,14 +81,16 @@ def main_dictionary_learning_single_token_ff():
     # Hyperparameters
 
     ## Language
-    num_tokens_per_language = 16
+    num_tokens_per_language = 4
     language_temperature = 2.0
 
     ## Network
-    embedding_size = 64
-    latent_size = 64
-    hidden_size = 128
-    hidden_layers = 4
+    embedding_size = 16
+    latent_size = 16
+    hidden_size = 256
+    encoder_hidden_layers = 1
+    decoder_hidden_layers = 1
+    classifier_hidden_layers = 1
 
     ## Optimizer
     learning_rate = 1e-4
@@ -117,20 +120,24 @@ def main_dictionary_learning_single_token_ff():
         embedding_size,
         latent_size,
         hidden_size,
-        hidden_layers,
-        hidden_activation=nn.SiLU(),
+        encoder_hidden_layers,
+        hidden_activation=nn.GELU(),
     )
 
     decoder = FeedForwardNetwork(
         embedding_size + latent_size,
         num_tokens_per_language * 2,
         hidden_size,
-        hidden_layers,
-        hidden_activation=nn.SiLU(),
+        decoder_hidden_layers,
+        hidden_activation=nn.GELU(),
     )
 
     classifier = FeedForwardNetwork(
-        latent_size, 1, hidden_size, hidden_layers, hidden_activation=nn.SiLU()
+        latent_size,
+        1,
+        hidden_size,
+        classifier_hidden_layers,
+        hidden_activation=nn.GELU(),
     )
 
     # Make optimizers
@@ -148,13 +155,14 @@ def main_dictionary_learning_single_token_ff():
         classifier_params, lr=learning_rate, weight_decay=weight_decay
     )
 
+    # Train
     pbar = trange(num_steps)
     for step in pbar:
         # Generate a batch of data
 
         ## Sample languages and base tokens
-        batch_languages = language_distribution.sample_n(batch_size)
-        batch_tokens = token_distribution.sample_n(batch_size)
+        batch_languages = language_distribution.sample((batch_size,))
+        batch_tokens = token_distribution.sample((batch_size,))
 
         ## Shift tokens to match their respective language
         batch_tokens = batch_tokens + batch_languages * num_tokens_per_language
@@ -172,11 +180,6 @@ def main_dictionary_learning_single_token_ff():
 
         autoencoder_loss = F.cross_entropy(batch_reconstructions, batch_tokens)
 
-        autoencoder_optimizer.zero_grad(set_to_none=True)
-        autoencoder_loss.backward()
-        autoencoder_optimizer.step()
-
-        """
         ## Adversarial loss
         classifier.requires_grad_(False)
         batch_pred_classes = classifier(batch_latents)
@@ -186,7 +189,7 @@ def main_dictionary_learning_single_token_ff():
             batch_pred_classes[:, 0], 1 - batch_languages.float()
         )
 
-        loss = autoencoder_loss + adversarial_loss
+        loss = autoencoder_loss + adversarial_loss * 1.0
 
         autoencoder_optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -198,23 +201,80 @@ def main_dictionary_learning_single_token_ff():
         with torch.no_grad():
             batch_token_embeddings = token_embeddings(batch_tokens)
             batch_latents = encoder(batch_token_embeddings)
+
+        batch_latents.requires_grad_(True)
         batch_pred_classes = classifier(batch_latents)
 
         classifier_loss = F.binary_cross_entropy_with_logits(
             batch_pred_classes[:, 0], batch_languages.float()
         )
 
-        classifier_optimizer.zero_grad(set_to_none=True)
-        classifier_loss.backward()
-        classifier_optimizer.step()
-        """
+        classifier_gradients = torch.autograd.grad(
+            batch_pred_classes,
+            batch_latents,
+            torch.ones_like(batch_pred_classes),
+            retain_graph=True,
+            create_graph=True,
+            only_inputs=True,
+        )[0]
 
-        classifier_loss = 0
-        adversarial_loss = 0
+        classifier_grad_penalty = torch.mean(
+            torch.square(torch.norm(classifier_gradients, p=2))
+        )
+
+        loss = classifier_loss + classifier_grad_penalty * 0.0
+
+        classifier_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        classifier_optimizer.step()
 
         pbar.set_postfix_str(
-            f"AE {autoencoder_loss:.2e} CLS {classifier_loss:.2e} ADV {adversarial_loss:.2e}"
+            f"AE {autoencoder_loss:.2e} CLS {classifier_loss:.2e} ADV {adversarial_loss:.2e} GRAD {classifier_grad_penalty:.2e}"
         )
+
+    # Generate evaluation data
+    num_eval_samples = num_tokens_per_language * 2
+    eval_tokens = torch.arange(num_eval_samples)
+    eval_languages = torch.zeros(num_eval_samples, dtype=torch.long)
+    eval_languages[num_tokens_per_language:] = 1
+
+    # Disable gradients for evaluation
+    with torch.no_grad():
+        # Embed tokens and languages
+        eval_token_embeddings = token_embeddings(eval_tokens)
+        eval_language_embeddings = language_embeddings(eval_languages)
+
+        # Encode tokens
+        eval_latents = encoder(eval_token_embeddings)
+
+        # Decode tokens for each language
+        eval_reconstructions = []
+        for lang in range(2):
+            lang_embedding = language_embeddings(torch.tensor([lang]))
+            decoder_inputs = torch.cat(
+                (lang_embedding.repeat(num_eval_samples, 1), eval_latents), dim=1
+            )
+            reconstructions = decoder(decoder_inputs)
+            reconstructions = F.softmax(reconstructions, dim=1)
+            eval_reconstructions.append(reconstructions)
+
+    # Plot the logits of each decoded token for all input tokens and both languages
+    fig, axs = plt.subplots(2, 1, figsize=(10, 8))
+    for lang in range(2):
+        ax = axs[lang]
+        logits = eval_reconstructions[lang].detach().numpy()
+        im = ax.imshow(logits, cmap="magma", aspect="auto")
+        ax.set_xticks(np.arange(num_eval_samples))
+        ax.set_yticks(np.arange(num_eval_samples))
+        ax.set_xticklabels(eval_tokens.numpy())
+        ax.set_yticklabels(eval_tokens.numpy())
+        ax.set_xlabel("Decoded Token")
+        ax.set_ylabel("Input Token")
+        ax.set_title(f"Language {lang}")
+        fig.colorbar(im, ax=ax)
+
+    plt.tight_layout()
+    plt.show()
 
 
 if __name__ == "__main__":
