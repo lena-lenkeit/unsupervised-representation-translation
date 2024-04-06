@@ -2,6 +2,7 @@
 for Unsupervised Translation"""
 
 import itertools
+import math
 from typing import Callable
 
 import matplotlib.pyplot as plt
@@ -66,6 +67,62 @@ class FeedForwardNetwork(nn.Module):
         return x
 
 
+class SelfNormalizingNetwork(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        hidden_size: int = -1,
+        num_hidden_layers: int = 0,
+        hidden_bias: bool = True,
+        output_bias: bool = False,
+        output_activation: Callable | None = None,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.hidden_bias = hidden_bias
+        self.output_bias = output_bias
+        self.output_activation = output_activation
+
+        self.layers = nn.ModuleList()
+        for i in range(num_hidden_layers + 1):
+            layer_input_size = hidden_size
+            layer_output_size = hidden_size
+            layer_bias = hidden_bias
+
+            is_first = i == 0
+            is_last = i == num_hidden_layers
+
+            if is_first:
+                layer_input_size = input_size
+            if is_last:
+                layer_output_size = output_size
+
+            layer = nn.Linear(layer_input_size, layer_output_size, bias=layer_bias)
+            with torch.no_grad():
+                layer.weight.normal_(std=math.sqrt(1.0 / layer_input_size))
+                if layer_bias:
+                    layer.bias.zero_()
+
+            self.layers.append(layer)
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+
+            is_last = i == self.num_hidden_layers
+            if not is_last:
+                x = F.selu(x)
+
+        if self.output_activation is not None:
+            x = self.output_activation(x)
+
+        return x
+
+
 def main_dictionary_learning_single_token_ff():
     """Extremely simple dictionary learning of two languages with a set of symbols,
     where each sentence is only a single symbol long, and symbols follow a pre-generated
@@ -77,82 +134,105 @@ def main_dictionary_learning_single_token_ff():
     # Generators
     np_rng = np.random.default_rng(1234)
     torch.random.manual_seed(1234)
+    torch.cuda.random.manual_seed(1234)
 
     # Hyperparameters
 
+    ## Device
+    device = "cuda"
+
     ## Language
-    num_tokens_per_language = 4
+    num_tokens_per_language = 8
     language_temperature = 2.0
 
     ## Network
-    embedding_size = 16
-    latent_size = 16
-    hidden_size = 256
-    encoder_hidden_layers = 1
-    decoder_hidden_layers = 1
-    classifier_hidden_layers = 1
+    embedding_size = 128
+    latent_size = 128
+    hidden_size = 128
+    encoder_hidden_layers = 2
+    decoder_hidden_layers = 2
+    classifier_hidden_layers = 4
 
     ## Optimizer
-    learning_rate = 1e-4
-    weight_decay = 0.0
+    learning_rate = 1e-3
+    weight_decay = 1e-2
+    betas = (0.0, 0.99)
 
     ## Training
     num_steps = 10000
-    batch_size = 512
+    batch_size = 4096
 
     # Generate language frequency distribution
-    token_distribution = torch.normal(
-        mean=0.0,
-        std=language_temperature,
-        size=(num_tokens_per_language,),
-        dtype=torch.float32,
-    )
-    token_distribution = Categorical(logits=token_distribution)
+    # token_distribution = torch.normal(
+    #    mean=0.0,
+    #    std=language_temperature,
+    #    size=(num_tokens_per_language,),
+    #    dtype=torch.float32,
+    # )
+
+    # token_distribution = torch.zeros((num_tokens_per_language,))
+
+    # token_distribution = Categorical(logits=token_distribution)
+
+    # Zipf's Law
+    token_distribution = 1.0 / (torch.arange(num_tokens_per_language) + 1)
+    token_distribution = Categorical(probs=token_distribution)
 
     language_distribution = torch.ones(2)
     language_distribution = Categorical(logits=language_distribution)
 
     # Build networks
-    token_embeddings = nn.Embedding(num_tokens_per_language * 2, embedding_size)
-    language_embeddings = nn.Embedding(2, embedding_size)
+    token_embeddings = nn.Embedding(num_tokens_per_language * 2, embedding_size).to(
+        device
+    )
+    language_embeddings = nn.Embedding(2, embedding_size).to(device)
 
-    encoder = FeedForwardNetwork(
+    encoder = SelfNormalizingNetwork(
         embedding_size,
         latent_size,
         hidden_size,
         encoder_hidden_layers,
-        hidden_activation=nn.GELU(),
-    )
+        # hidden_activation=nn.GELU(),
+    ).to(device)
 
-    decoder = FeedForwardNetwork(
+    decoder = SelfNormalizingNetwork(
         embedding_size + latent_size,
         num_tokens_per_language * 2,
         hidden_size,
         decoder_hidden_layers,
-        hidden_activation=nn.GELU(),
-    )
+        # hidden_activation=nn.GELU(),
+    ).to(device)
 
-    classifier = FeedForwardNetwork(
+    classifier = SelfNormalizingNetwork(
         latent_size,
         1,
         hidden_size,
         classifier_hidden_layers,
-        hidden_activation=nn.GELU(),
-    )
+        # hidden_activation=nn.GELU(),
+    ).to(device)
 
     # Make optimizers
     autoencoder_params = itertools.chain(
         token_embeddings.parameters(),
         language_embeddings.parameters(),
         encoder.parameters(),
+        decoder.parameters(),
     )
     classifier_params = classifier.parameters()
 
     autoencoder_optimizer = optim.AdamW(
-        autoencoder_params, lr=learning_rate, weight_decay=weight_decay
+        autoencoder_params, lr=learning_rate, weight_decay=weight_decay, betas=betas
     )
     classifier_optimizer = optim.AdamW(
-        classifier_params, lr=learning_rate, weight_decay=weight_decay
+        classifier_params, lr=learning_rate, weight_decay=weight_decay, betas=betas
+    )
+
+    autoencoder_scheduler = optim.lr_scheduler.ExponentialLR(
+        autoencoder_optimizer, gamma=1.0
+    )
+
+    classifier_scheduler = optim.lr_scheduler.ExponentialLR(
+        classifier_optimizer, gamma=1.0
     )
 
     # Train
@@ -161,8 +241,8 @@ def main_dictionary_learning_single_token_ff():
         # Generate a batch of data
 
         ## Sample languages and base tokens
-        batch_languages = language_distribution.sample((batch_size,))
-        batch_tokens = token_distribution.sample((batch_size,))
+        batch_languages = language_distribution.sample((batch_size,)).to(device)
+        batch_tokens = token_distribution.sample((batch_size,)).to(device)
 
         ## Shift tokens to match their respective language
         batch_tokens = batch_tokens + batch_languages * num_tokens_per_language
@@ -189,11 +269,25 @@ def main_dictionary_learning_single_token_ff():
             batch_pred_classes[:, 0], 1 - batch_languages.float()
         )
 
-        loss = autoencoder_loss + adversarial_loss * 1.0
+        # adversarial_loss = -torch.mean(
+        #    batch_pred_classes[:, 0] * (batch_languages * 2 - 1)
+        # )
+
+        loss = autoencoder_loss + adversarial_loss * 100.0
 
         autoencoder_optimizer.zero_grad(set_to_none=True)
         loss.backward()
         autoencoder_optimizer.step()
+        autoencoder_scheduler.step()
+
+        # Generate a batch of data
+
+        ## Sample languages and base tokens
+        batch_languages = language_distribution.sample((batch_size,)).to(device)
+        batch_tokens = token_distribution.sample((batch_size,)).to(device)
+
+        ## Shift tokens to match their respective language
+        batch_tokens = batch_tokens + batch_languages * num_tokens_per_language
 
         # Step classifier
 
@@ -209,6 +303,10 @@ def main_dictionary_learning_single_token_ff():
             batch_pred_classes[:, 0], batch_languages.float()
         )
 
+        # classifier_loss = torch.mean(
+        #    batch_pred_classes[:, 0] * (batch_languages * 2 - 1)
+        # )
+
         classifier_gradients = torch.autograd.grad(
             batch_pred_classes,
             batch_latents,
@@ -219,7 +317,7 @@ def main_dictionary_learning_single_token_ff():
         )[0]
 
         classifier_grad_penalty = torch.mean(
-            torch.square(torch.norm(classifier_gradients, p=2))
+            torch.square(torch.norm(classifier_gradients, p=2, dim=1))
         )
 
         loss = classifier_loss + classifier_grad_penalty * 0.0
@@ -227,6 +325,7 @@ def main_dictionary_learning_single_token_ff():
         classifier_optimizer.zero_grad(set_to_none=True)
         loss.backward()
         classifier_optimizer.step()
+        classifier_scheduler.step()
 
         pbar.set_postfix_str(
             f"AE {autoencoder_loss:.2e} CLS {classifier_loss:.2e} ADV {adversarial_loss:.2e} GRAD {classifier_grad_penalty:.2e}"
@@ -234,8 +333,8 @@ def main_dictionary_learning_single_token_ff():
 
     # Generate evaluation data
     num_eval_samples = num_tokens_per_language * 2
-    eval_tokens = torch.arange(num_eval_samples)
-    eval_languages = torch.zeros(num_eval_samples, dtype=torch.long)
+    eval_tokens = torch.arange(num_eval_samples).to(device)
+    eval_languages = torch.zeros(num_eval_samples, dtype=torch.long).to(device)
     eval_languages[num_tokens_per_language:] = 1
 
     # Disable gradients for evaluation
@@ -250,7 +349,7 @@ def main_dictionary_learning_single_token_ff():
         # Decode tokens for each language
         eval_reconstructions = []
         for lang in range(2):
-            lang_embedding = language_embeddings(torch.tensor([lang]))
+            lang_embedding = language_embeddings(torch.tensor([lang]).to(device))
             decoder_inputs = torch.cat(
                 (lang_embedding.repeat(num_eval_samples, 1), eval_latents), dim=1
             )
@@ -262,12 +361,12 @@ def main_dictionary_learning_single_token_ff():
     fig, axs = plt.subplots(2, 1, figsize=(10, 8))
     for lang in range(2):
         ax = axs[lang]
-        logits = eval_reconstructions[lang].detach().numpy()
+        logits = eval_reconstructions[lang].detach().cpu().numpy()
         im = ax.imshow(logits, cmap="magma", aspect="auto")
-        ax.set_xticks(np.arange(num_eval_samples))
-        ax.set_yticks(np.arange(num_eval_samples))
-        ax.set_xticklabels(eval_tokens.numpy())
-        ax.set_yticklabels(eval_tokens.numpy())
+        # ax.set_xticks(np.arange(num_eval_samples))
+        # ax.set_yticks(np.arange(num_eval_samples))
+        # ax.set_xticklabels(eval_tokens.cpu().numpy())
+        # ax.set_yticklabels(eval_tokens.cpu().numpy())
         ax.set_xlabel("Decoded Token")
         ax.set_ylabel("Input Token")
         ax.set_title(f"Language {lang}")
