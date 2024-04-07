@@ -171,13 +171,13 @@ def main_dictionary_learning_single_token_ff():
     embedding_size = 64
     latent_size = 64
     hidden_size = 64
-    encoder_hidden_layers = 0
+    encoder_hidden_layers = 2
     decoder_hidden_layers = 2
     classifier_hidden_layers = 4
 
     ## Optimizer
     learning_rate = 1e-3
-    weight_decay = 1e-2
+    weight_decay = 0.0
     betas = (0.0, 0.99)
 
     ## Training
@@ -288,6 +288,7 @@ def main_dictionary_learning_single_token_ff():
         batch_reconstructions = decoder(decoder_inputs)
 
         autoencoder_loss = F.cross_entropy(batch_reconstructions, batch_tokens)
+
         latent_loss = torch.mean(standard_normal_log_kl_div(batch_mean, batch_log_var))
         expected_relative_entropy = torch.mean(
             torch.sum(standard_normal_log_kl_div(batch_mean, batch_log_var), dim=1),
@@ -307,7 +308,38 @@ def main_dictionary_learning_single_token_ff():
         #    batch_pred_classes[:, 0] * (batch_languages * 2 - 1)
         # )
 
-        loss = autoencoder_loss + latent_loss * 1.0 + adversarial_loss * 1.0
+        ## Consistency loss
+        with torch.no_grad():
+            batch_language_embeddings = language_embeddings(1 - batch_languages)
+
+            decoder_inputs = torch.cat(
+                (batch_language_embeddings, batch_latents), dim=1
+            )
+            batch_reconstructions = decoder(decoder_inputs)
+
+            batch_translated_tokens = Categorical(logits=batch_reconstructions).sample()
+
+        batch_token_embeddings = token_embeddings(batch_translated_tokens)
+        batch_language_embeddings = language_embeddings(batch_languages)
+
+        batch_latents = encoder(batch_token_embeddings)
+
+        batch_mean, batch_log_var = torch.split(batch_latents, latent_size, dim=1)
+        batch_latents = batch_mean + torch.normal(
+            0.0, 1.0, size=batch_mean.shape, device=device
+        ) * torch.exp(0.5 * batch_log_var)
+
+        decoder_inputs = torch.cat((batch_language_embeddings, batch_latents), dim=1)
+        batch_reconstructions = decoder(decoder_inputs)
+
+        consistency_loss = F.cross_entropy(batch_reconstructions, batch_tokens)
+
+        loss = (
+            autoencoder_loss
+            + latent_loss * 1.0
+            + adversarial_loss * 1.0
+            + consistency_loss * 1.0
+        )
 
         autoencoder_optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -367,7 +399,7 @@ def main_dictionary_learning_single_token_ff():
         classifier_scheduler.step()
 
         pbar.set_postfix_str(
-            f"AE {autoencoder_loss:.2e} CLS {classifier_loss:.2e} ADV {adversarial_loss:.2e} GRAD {classifier_grad_penalty:.2e} Z {latent_loss:.2e} E[H] {expected_relative_entropy:.2e} bits"
+            f"AE {autoencoder_loss:.2e} CLS {classifier_loss:.2e} ADV {adversarial_loss:.2e} GRAD {classifier_grad_penalty:.2e} Z {latent_loss:.2e} E[H] {expected_relative_entropy:.2e} bits C {consistency_loss:.2e}"
         )
 
     # Generate evaluation data
