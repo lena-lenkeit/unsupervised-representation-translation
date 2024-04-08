@@ -3,7 +3,7 @@ for Unsupervised Translation"""
 
 import itertools
 import math
-from typing import Callable
+from typing import Callable, Iterable, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -77,6 +77,7 @@ class SelfNormalizingNetwork(nn.Module):
         hidden_bias: bool = True,
         output_bias: bool = False,
         output_activation: Callable | None = None,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.input_size = input_size
@@ -86,6 +87,7 @@ class SelfNormalizingNetwork(nn.Module):
         self.hidden_bias = hidden_bias
         self.output_bias = output_bias
         self.output_activation = output_activation
+        self.dropout = nn.AlphaDropout(dropout)
 
         self.layers = nn.ModuleList()
         for i in range(num_hidden_layers + 1):
@@ -116,9 +118,94 @@ class SelfNormalizingNetwork(nn.Module):
             is_last = i == self.num_hidden_layers
             if not is_last:
                 x = F.selu(x)
+                x = self.dropout(x)
 
         if self.output_activation is not None:
             x = self.output_activation(x)
+
+        return x
+
+
+class TransformerFeedForwardBlock(nn.Module):
+    """Standard pre-norm transformer FF block"""
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        activation: Callable = nn.ReLU(),
+        dropout: float = 0.1,
+    ):
+        super(TransformerFeedForwardBlock, self).__init__()
+
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.layer_norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.activation = activation
+
+        with torch.no_grad():
+            self.linear1.weight.normal_(std=0.02)
+            self.linear2.weight.normal_(std=0.02)
+
+            self.linear1.bias.zero_()
+            self.linear2.bias.zero_()
+
+    def forward(self, x: torch.Tensor):
+        residual = x
+
+        x = self.layer_norm(x)
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        x = self.dropout(x)
+
+        x = x + residual
+
+        return x
+
+
+class TransformerFeedForwardStack(nn.Module):
+    def __init__(
+        self,
+        num_blocks: int,
+        d_model: int,
+        d_ff: int,
+        d_input: int,
+        d_head: int,
+        activation: Callable = nn.ReLU(),
+        dropout: float = 0.1,
+    ):
+        super(TransformerFeedForwardStack, self).__init__()
+        self.layers = nn.ModuleList(
+            [
+                TransformerFeedForwardBlock(d_model, d_ff, activation, dropout)
+                for _ in range(num_blocks)
+            ]
+        )
+
+        self.input_norm = nn.LayerNorm(d_input)
+        self.final_norm = nn.LayerNorm(d_model)
+
+        self.input = nn.Linear(d_input, d_model)
+        self.head = nn.Linear(d_model, d_head)
+        with torch.no_grad():
+            self.head.weight.normal_(std=0.02)
+            self.input.weight.normal_(std=0.02)
+
+            self.head.bias.zero_()
+            self.input.bias.zero_()
+
+    def forward(self, x: torch.Tensor):
+        x = self.input_norm(x)
+        x = self.input(x)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.final_norm(x)
+        x = self.head(x)
 
         return x
 
@@ -145,6 +232,57 @@ def standard_normal_log_kl_div(mean: torch.Tensor, log_var: torch.Tensor):
     return 0.5 * (torch.exp(log_var) + torch.square(mean) - 1 - log_var)
 
 
+def layer_norm(x: torch.Tensor, dim: int = -1):
+    return (x - torch.mean(x, dim=dim, keepdim=True)) / torch.std(
+        x, dim=dim, keepdim=True
+    )
+
+
+def filter_weight_decay(named_params: Iterable[Tuple[str, nn.Parameter]]):
+    with_weight_decay: List[nn.Parameter] = []
+    without_weight_decay: List[nn.Parameter] = []
+
+    for n, p in named_params:
+        apply_weight_decay = True
+
+        # No weight decay for all bias terms
+        if "bias" in n:
+            apply_weight_decay = False
+
+        # No weight decay for all layer norms
+        if "norm" in n:
+            apply_weight_decay = False
+
+        if apply_weight_decay:
+            with_weight_decay.append(p)
+        else:
+            without_weight_decay.append(p)
+
+    return with_weight_decay, without_weight_decay
+
+
+def make_param_groups(
+    named_params: Iterable[Tuple[str, nn.Parameter]],
+    learning_rate: float,
+    weight_decay: float,
+):
+    with_weight_decay, without_weight_decay = filter_weight_decay(named_params)
+
+    base_group = {
+        "params": with_weight_decay,
+        "lr": learning_rate,
+        "weight_decay": weight_decay,
+    }
+
+    no_wd_group = {
+        "params": without_weight_decay,
+        "lr": learning_rate,
+        "weight_decay": 0.0,
+    }
+
+    return [base_group, no_wd_group]
+
+
 def main_dictionary_learning_single_token_ff():
     """Extremely simple dictionary learning of two languages with a set of symbols,
     where each sentence is only a single symbol long, and symbols follow a pre-generated
@@ -164,25 +302,36 @@ def main_dictionary_learning_single_token_ff():
     device = "cuda"
 
     ## Language
-    num_tokens_per_language = 4
+    num_tokens_per_language = 16
     language_temperature = 2.0
 
     ## Network
-    embedding_size = 64
-    latent_size = 64
-    hidden_size = 64
-    encoder_hidden_layers = 2
-    decoder_hidden_layers = 2
+    embedding_size = 512
+    latent_size = 512
+    hidden_size = 512
+    encoder_hidden_layers = 4
+    decoder_hidden_layers = 4
     classifier_hidden_layers = 4
+    dropout = 0.0
+    is_vae = True
+    is_wgan = False
+    normalize_embeddings = False
+    # sum_language_embeddings = True
 
     ## Optimizer
-    learning_rate = 1e-3
-    weight_decay = 0.0
-    betas = (0.0, 0.99)
+    learning_rate = 1e-4
+    weight_decay = 1e-2
+    betas = (0.5, 0.99)
 
     ## Training
-    num_steps = 10000
-    batch_size = 4096
+    num_steps = 1000
+    batch_size = 512
+
+    ## Losses
+    adversarial_weight = 1.0
+    consistency_weight = 1.0
+    latent_weight = 0.1
+    gp_weight = 0.0
 
     # Generate language frequency distribution
     # token_distribution = torch.normal(
@@ -199,6 +348,7 @@ def main_dictionary_learning_single_token_ff():
     # Zipf's Law
     token_distribution = 1.0 / (torch.arange(num_tokens_per_language) + 1)
     token_distribution = Categorical(probs=token_distribution)
+
     print(token_distribution.entropy())
     print(Categorical(probs=torch.ones_like(token_distribution.probs)).entropy())
 
@@ -211,12 +361,23 @@ def main_dictionary_learning_single_token_ff():
     )
     language_embeddings = nn.Embedding(2, embedding_size).to(device)
 
+    # with torch.no_grad():
+    #    token_embeddings.weight.normal_(std=1e-5)
+    #    language_embeddings.weight.normal_(std=1e-5)
+
+    # with torch.no_grad():
+    #    token_embeddings.weight[:num_tokens_per_language] = token_embeddings.weight[
+    #        num_tokens_per_language:
+    #    ]
+
+    """
     encoder = SelfNormalizingNetwork(
         embedding_size,
-        latent_size * 2,
+        (latent_size * 2) if is_vae else latent_size,
         hidden_size,
         encoder_hidden_layers,
         # hidden_activation=nn.GELU(),
+        dropout=dropout,
     ).to(device)
 
     decoder = SelfNormalizingNetwork(
@@ -225,6 +386,7 @@ def main_dictionary_learning_single_token_ff():
         hidden_size,
         decoder_hidden_layers,
         # hidden_activation=nn.GELU(),
+        dropout=dropout,
     ).to(device)
 
     classifier = SelfNormalizingNetwork(
@@ -233,9 +395,42 @@ def main_dictionary_learning_single_token_ff():
         hidden_size,
         classifier_hidden_layers,
         # hidden_activation=nn.GELU(),
+        dropout=dropout,
+    ).to(device)
+    """
+
+    encoder = TransformerFeedForwardStack(
+        encoder_hidden_layers,
+        hidden_size,
+        hidden_size * 4,
+        embedding_size,
+        (latent_size * 2) if is_vae else latent_size,
+        activation=nn.GELU(),
+        dropout=dropout,
+    ).to(device)
+
+    decoder = TransformerFeedForwardStack(
+        decoder_hidden_layers,
+        hidden_size,
+        hidden_size * 4,
+        embedding_size + latent_size,
+        num_tokens_per_language * 2,
+        activation=nn.GELU(),
+        dropout=dropout,
+    ).to(device)
+
+    classifier = TransformerFeedForwardStack(
+        classifier_hidden_layers,
+        hidden_size,
+        hidden_size * 4,
+        latent_size,
+        2,
+        activation=nn.GELU(),
+        dropout=dropout,
     ).to(device)
 
     # Make optimizers
+    """
     autoencoder_params = itertools.chain(
         token_embeddings.parameters(),
         language_embeddings.parameters(),
@@ -250,18 +445,41 @@ def main_dictionary_learning_single_token_ff():
     classifier_optimizer = optim.AdamW(
         classifier_params, lr=learning_rate, weight_decay=weight_decay, betas=betas
     )
+    """
+
+    autoencoder_params = itertools.chain(
+        token_embeddings.named_parameters(),
+        language_embeddings.named_parameters(),
+        encoder.named_parameters(),
+        decoder.named_parameters(),
+    )
+    classifier_params = classifier.named_parameters()
+
+    autoencoder_optimizer = optim.AdamW(
+        make_param_groups(autoencoder_params, learning_rate, weight_decay), betas=betas
+    )
+    classifier_optimizer = optim.AdamW(
+        make_param_groups(classifier_params, learning_rate, weight_decay), betas=betas
+    )
 
     autoencoder_scheduler = optim.lr_scheduler.ExponentialLR(
-        autoencoder_optimizer, gamma=0.9999
+        autoencoder_optimizer, gamma=1.0
     )
 
     classifier_scheduler = optim.lr_scheduler.ExponentialLR(
-        classifier_optimizer, gamma=0.9999
+        classifier_optimizer, gamma=1.0
     )
+
+    encoder.train()
+    decoder.train()
+    classifier.train()
 
     # Train
     pbar = trange(num_steps)
     for step in pbar:
+        # adversarial_weight = step / num_steps
+        # consistency_weight = 0.1 * step / num_steps
+
         # Generate a batch of data
 
         ## Sample languages and base tokens
@@ -277,40 +495,54 @@ def main_dictionary_learning_single_token_ff():
         batch_token_embeddings = token_embeddings(batch_tokens)
         batch_language_embeddings = language_embeddings(batch_languages)
 
+        if normalize_embeddings:
+            batch_token_embeddings = layer_norm(batch_token_embeddings)
+            batch_language_embeddings = layer_norm(batch_language_embeddings)
+
         batch_latents = encoder(batch_token_embeddings)
 
-        batch_mean, batch_log_var = torch.split(batch_latents, latent_size, dim=1)
-        batch_latents = batch_mean + torch.normal(
-            0.0, 1.0, size=batch_mean.shape, device=device
-        ) * torch.exp(0.5 * batch_log_var)
+        if is_vae:
+            batch_mean, batch_log_var = torch.split(batch_latents, latent_size, dim=1)
+            batch_latents = batch_mean + torch.normal(
+                0.0, 1.0, size=batch_mean.shape, device=device
+            ) * torch.exp(0.5 * batch_log_var)
 
         decoder_inputs = torch.cat((batch_language_embeddings, batch_latents), dim=1)
         batch_reconstructions = decoder(decoder_inputs)
 
         autoencoder_loss = F.cross_entropy(batch_reconstructions, batch_tokens)
 
-        latent_loss = torch.mean(standard_normal_log_kl_div(batch_mean, batch_log_var))
-        expected_relative_entropy = torch.mean(
-            torch.sum(standard_normal_log_kl_div(batch_mean, batch_log_var), dim=1),
-            dim=0,
-        )
+        if is_vae:
+            latent_loss = torch.mean(
+                standard_normal_log_kl_div(batch_mean, batch_log_var)
+            )
+            expected_relative_entropy = torch.mean(
+                torch.sum(standard_normal_log_kl_div(batch_mean, batch_log_var), dim=1),
+                dim=0,
+            )
+        else:
+            latent_loss = 0.0
+            expected_relative_entropy = 0.0
 
         ## Adversarial loss
         classifier.requires_grad_(False)
         batch_pred_classes = classifier(batch_latents)
         classifier.requires_grad_(True)
 
-        adversarial_loss = F.binary_cross_entropy_with_logits(
-            batch_pred_classes[:, 0], 1 - batch_languages.float()
-        )
-
-        # adversarial_loss = -torch.mean(
-        #    batch_pred_classes[:, 0] * (batch_languages * 2 - 1)
-        # )
+        if is_wgan:
+            adversarial_loss = -torch.mean(
+                batch_pred_classes[:, 0] * (batch_languages * 2 - 1)
+            )
+        else:
+            adversarial_loss = F.binary_cross_entropy_with_logits(
+                batch_pred_classes[:, 0], 1 - batch_languages.float()
+            )
 
         ## Consistency loss
         with torch.no_grad():
             batch_language_embeddings = language_embeddings(1 - batch_languages)
+            if normalize_embeddings:
+                batch_language_embeddings = layer_norm(batch_language_embeddings)
 
             decoder_inputs = torch.cat(
                 (batch_language_embeddings, batch_latents), dim=1
@@ -322,12 +554,17 @@ def main_dictionary_learning_single_token_ff():
         batch_token_embeddings = token_embeddings(batch_translated_tokens)
         batch_language_embeddings = language_embeddings(batch_languages)
 
+        if normalize_embeddings:
+            batch_token_embeddings = layer_norm(batch_token_embeddings)
+            batch_language_embeddings = layer_norm(batch_language_embeddings)
+
         batch_latents = encoder(batch_token_embeddings)
 
-        batch_mean, batch_log_var = torch.split(batch_latents, latent_size, dim=1)
-        batch_latents = batch_mean + torch.normal(
-            0.0, 1.0, size=batch_mean.shape, device=device
-        ) * torch.exp(0.5 * batch_log_var)
+        if is_vae:
+            batch_mean, batch_log_var = torch.split(batch_latents, latent_size, dim=1)
+            batch_latents = batch_mean + torch.normal(
+                0.0, 1.0, size=batch_mean.shape, device=device
+            ) * torch.exp(0.5 * batch_log_var)
 
         decoder_inputs = torch.cat((batch_language_embeddings, batch_latents), dim=1)
         batch_reconstructions = decoder(decoder_inputs)
@@ -336,9 +573,10 @@ def main_dictionary_learning_single_token_ff():
 
         loss = (
             autoencoder_loss
-            + latent_loss * 1.0
-            + adversarial_loss * 1.0
-            + consistency_loss * 1.0
+            # + latent_loss * latent_weight
+            + expected_relative_entropy * latent_weight
+            + adversarial_loss * adversarial_weight
+            + consistency_loss * consistency_weight
         )
 
         autoencoder_optimizer.zero_grad(set_to_none=True)
@@ -360,23 +598,29 @@ def main_dictionary_learning_single_token_ff():
         ## Classifier loss
         with torch.no_grad():
             batch_token_embeddings = token_embeddings(batch_tokens)
+            if normalize_embeddings:
+                batch_token_embeddings = layer_norm(batch_token_embeddings)
             batch_latents = encoder(batch_token_embeddings)
 
-            batch_mean, batch_log_var = torch.split(batch_latents, latent_size, dim=1)
-            batch_latents = batch_mean + torch.normal(
-                0.0, 1.0, size=batch_mean.shape, device=device
-            ) * torch.exp(0.5 * batch_log_var)
+            if is_vae:
+                batch_mean, batch_log_var = torch.split(
+                    batch_latents, latent_size, dim=1
+                )
+                batch_latents = batch_mean + torch.normal(
+                    0.0, 1.0, size=batch_mean.shape, device=device
+                ) * torch.exp(0.5 * batch_log_var)
 
         batch_latents.requires_grad_(True)
         batch_pred_classes = classifier(batch_latents)
 
-        classifier_loss = F.binary_cross_entropy_with_logits(
-            batch_pred_classes[:, 0], batch_languages.float()
-        )
-
-        # classifier_loss = torch.mean(
-        #    batch_pred_classes[:, 0] * (batch_languages * 2 - 1)
-        # )
+        if is_wgan:
+            classifier_loss = torch.mean(
+                batch_pred_classes[:, 0] * (batch_languages * 2 - 1)
+            )
+        else:
+            classifier_loss = F.binary_cross_entropy_with_logits(
+                batch_pred_classes[:, 0], batch_languages.float()
+            )
 
         classifier_gradients = torch.autograd.grad(
             batch_pred_classes,
@@ -391,7 +635,7 @@ def main_dictionary_learning_single_token_ff():
             torch.square(torch.norm(classifier_gradients, p=2, dim=1))
         )
 
-        loss = classifier_loss + classifier_grad_penalty * 1.0
+        loss = classifier_loss + classifier_grad_penalty * gp_weight
 
         classifier_optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -399,8 +643,12 @@ def main_dictionary_learning_single_token_ff():
         classifier_scheduler.step()
 
         pbar.set_postfix_str(
-            f"AE {autoencoder_loss:.2e} CLS {classifier_loss:.2e} ADV {adversarial_loss:.2e} GRAD {classifier_grad_penalty:.2e} Z {latent_loss:.2e} E[H] {expected_relative_entropy:.2e} bits C {consistency_loss:.2e}"
+            f"AE {autoencoder_loss:.2e} CLS {classifier_loss:.2e} ADV {adversarial_loss:.2e} GRAD {classifier_grad_penalty:.2e} Z {latent_loss:.2e} E[H] {expected_relative_entropy:.2e} nats C {consistency_loss:.2e}"
         )
+
+    encoder.eval()
+    decoder.eval()
+    classifier.eval()
 
     # Generate evaluation data
     num_eval_samples = num_tokens_per_language * 2
@@ -414,10 +662,15 @@ def main_dictionary_learning_single_token_ff():
         eval_token_embeddings = token_embeddings(eval_tokens)
         eval_language_embeddings = language_embeddings(eval_languages)
 
+        if normalize_embeddings:
+            eval_token_embeddings = layer_norm(eval_token_embeddings)
+            eval_language_embeddings = layer_norm(eval_language_embeddings)
+
         # Encode tokens
         eval_latents = encoder(eval_token_embeddings)
-        eval_mean, eval_log_var = torch.split(eval_latents, latent_size, dim=1)
-        eval_latents = eval_mean
+        if is_vae:
+            eval_mean, eval_log_var = torch.split(eval_latents, latent_size, dim=1)
+            eval_latents = eval_mean
 
         # Decode tokens for each language
         eval_reconstructions = []
