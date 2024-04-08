@@ -313,9 +313,11 @@ def main_dictionary_learning_single_token_ff():
     decoder_hidden_layers = 4
     classifier_hidden_layers = 4
     dropout = 0.0
-    is_vae = True
+    is_vae = False
     is_wgan = False
     normalize_embeddings = False
+    group_classifier = True
+    classifier_group_size = 2
     # sum_language_embeddings = True
 
     ## Optimizer
@@ -328,8 +330,8 @@ def main_dictionary_learning_single_token_ff():
     batch_size = 512
 
     ## Losses
-    adversarial_weight = 1.0
-    consistency_weight = 1.0
+    adversarial_weight = 10.0
+    consistency_weight = 0.0
     latent_weight = 0.1
     gp_weight = 0.0
 
@@ -423,8 +425,8 @@ def main_dictionary_learning_single_token_ff():
         classifier_hidden_layers,
         hidden_size,
         hidden_size * 4,
-        latent_size,
-        2,
+        latent_size * classifier_group_size,
+        classifier_group_size,
         activation=nn.GELU(),
         dropout=dropout,
     ).to(device)
@@ -483,7 +485,12 @@ def main_dictionary_learning_single_token_ff():
         # Generate a batch of data
 
         ## Sample languages and base tokens
-        batch_languages = language_distribution.sample((batch_size,)).to(device)
+
+        if group_classifier:
+            batch_languages = torch.arange(2, device=device)
+            batch_languages = batch_languages.repeat_interleave(batch_size // 2)
+        else:
+            batch_languages = language_distribution.sample((batch_size,)).to(device)
         batch_tokens = token_distribution.sample((batch_size,)).to(device)
 
         ## Shift tokens to match their respective language
@@ -525,17 +532,32 @@ def main_dictionary_learning_single_token_ff():
             expected_relative_entropy = 0.0
 
         ## Adversarial loss
+        if group_classifier:
+            batch_cls_latents = batch_latents.reshape(
+                batch_size // classifier_group_size, -1
+            )
+
+            batch_cls_languages = batch_languages.reshape(
+                batch_size // classifier_group_size, classifier_group_size
+            )
+        else:
+            batch_cls_latents = batch_latents
+            batch_cls_languages = batch_languages
+
         classifier.requires_grad_(False)
-        batch_pred_classes = classifier(batch_latents)
+        batch_pred_classes = classifier(batch_cls_latents)
         classifier.requires_grad_(True)
+
+        if not group_classifier:
+            batch_pred_classes = batch_pred_classes[:, 0]
 
         if is_wgan:
             adversarial_loss = -torch.mean(
-                batch_pred_classes[:, 0] * (batch_languages * 2 - 1)
+                batch_pred_classes * (batch_cls_languages * 2 - 1)
             )
         else:
             adversarial_loss = F.binary_cross_entropy_with_logits(
-                batch_pred_classes[:, 0], 1 - batch_languages.float()
+                batch_pred_classes, 1 - batch_cls_languages.float()
             )
 
         ## Consistency loss
@@ -587,8 +609,12 @@ def main_dictionary_learning_single_token_ff():
         # Generate a batch of data
 
         ## Sample languages and base tokens
-        batch_languages = language_distribution.sample((batch_size,)).to(device)
         batch_tokens = token_distribution.sample((batch_size,)).to(device)
+        if group_classifier:
+            batch_languages = torch.arange(2, device=device)
+            batch_languages = batch_languages.repeat_interleave(batch_size // 2)
+        else:
+            batch_languages = language_distribution.sample((batch_size,)).to(device)
 
         ## Shift tokens to match their respective language
         batch_tokens = batch_tokens + batch_languages * num_tokens_per_language
@@ -610,16 +636,26 @@ def main_dictionary_learning_single_token_ff():
                     0.0, 1.0, size=batch_mean.shape, device=device
                 ) * torch.exp(0.5 * batch_log_var)
 
+            if group_classifier:
+                batch_latents = batch_latents.reshape(
+                    batch_size // classifier_group_size, -1
+                )
+
+                batch_languages = batch_languages.reshape(
+                    batch_size // classifier_group_size, classifier_group_size
+                )
+
         batch_latents.requires_grad_(True)
         batch_pred_classes = classifier(batch_latents)
 
+        if not group_classifier:
+            batch_pred_classes = batch_pred_classes[:, 0]
+
         if is_wgan:
-            classifier_loss = torch.mean(
-                batch_pred_classes[:, 0] * (batch_languages * 2 - 1)
-            )
+            classifier_loss = torch.mean(batch_pred_classes * (batch_languages * 2 - 1))
         else:
             classifier_loss = F.binary_cross_entropy_with_logits(
-                batch_pred_classes[:, 0], batch_languages.float()
+                batch_pred_classes, batch_languages.float()
             )
 
         classifier_gradients = torch.autograd.grad(
