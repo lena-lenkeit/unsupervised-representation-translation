@@ -353,7 +353,9 @@ class EncDecDataset(Dataset):
         return asdict(inputs)
 
 
-def make_wikisentence_dataset(filepath: str):
+def make_wikisentence_dataset(
+    filepath: str, shuffle: bool = True, iterable: bool = True, clean_lines: bool = True
+):
     def clean_line(row: Dict[str, Any]) -> Dict[str, Any]:
         text: str = row["text"]
         text = text.split(maxsplit=1)[-1].strip()
@@ -361,7 +363,13 @@ def make_wikisentence_dataset(filepath: str):
         return {"text": text}
 
     dataset = datasets.load_dataset("text", split="train", data_files=filepath)
-    dataset = dataset.shuffle().to_iterable_dataset().map(clean_line)
+
+    if shuffle:
+        dataset = dataset.shuffle().flatten_indices(keep_in_memory=True)
+    if iterable:
+        dataset = dataset.to_iterable_dataset()
+    if clean_lines:
+        dataset = dataset.map(clean_line)
 
     return dataset
 
