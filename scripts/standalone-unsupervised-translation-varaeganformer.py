@@ -36,6 +36,7 @@ class UTT5Config(T5Config):
         is_vae: bool = True,
         has_classifier: bool = True,
         num_classifier_layers: int | None = None,
+        do_backtranslation: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -47,6 +48,7 @@ class UTT5Config(T5Config):
             if num_classifier_layers is not None
             else self.num_layers
         )
+        self.do_backtranslation = do_backtranslation
 
 
 class T5ForUnsupervisedTranslation(T5ForConditionalGeneration):
@@ -78,17 +80,20 @@ class T5ForUnsupervisedTranslation(T5ForConditionalGeneration):
         decoder_config.num_layers = config.num_decoder_layers
         self.decoder = T5Stack(decoder_config, self.shared)
 
-        classifier_config = copy.deepcopy(config)
-        classifier_config.is_decoder = False
-        classifier_config.is_encoder_decoder = False
-        classifier_config.use_cache = False
-        classifier_config.num_layers = config.num_classifier_layers
-        self.classifier = T5Stack(classifier_config, self.shared)
+        if config.has_classifier:
+            classifier_config = copy.deepcopy(config)
+            classifier_config.is_decoder = False
+            classifier_config.is_encoder_decoder = False
+            classifier_config.use_cache = False
+            classifier_config.num_layers = config.num_classifier_layers
+            self.classifier = T5Stack(classifier_config, self.shared)
 
-        self.mean_head = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.log_var_head = nn.Linear(config.d_model, config.d_model, bias=False)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.cls_head = nn.Linear(config.d_model, 1, bias=False)
+        if config.is_vae:
+            self.mean_head = nn.Linear(config.d_model, config.d_model, bias=False)
+            self.log_var_head = nn.Linear(config.d_model, config.d_model, bias=False)
+        if config.has_classifier:
+            self.cls_head = nn.Linear(config.d_model, 1, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -101,14 +106,15 @@ class T5ForUnsupervisedTranslation(T5ForConditionalGeneration):
         self.shared = new_embeddings
         self.encoder.set_input_embeddings(new_embeddings)
         self.decoder.set_input_embeddings(new_embeddings)
-        self.classifier.set_input_embeddings(new_embeddings)
+        if self.config.has_classifier:
+            self.classifier.set_input_embeddings(new_embeddings)
 
     def _tie_weights(self):
         if self.config.tie_word_embeddings:
             self._tie_or_clone_weights(self.encoder.embed_tokens, self.shared)
             self._tie_or_clone_weights(self.decoder.embed_tokens, self.shared)
-            self._tie_or_clone_weights(self.classifier.embed_tokens, self.shared)
-            return
+            if self.config.has_classifier:
+                self._tie_or_clone_weights(self.classifier.embed_tokens, self.shared)
 
 
 def standard_normal_log_kl_div(mean: torch.Tensor, log_var: torch.Tensor):
@@ -362,19 +368,20 @@ def train_model(
         model.lm_head.named_parameters(prefix="lm_head"),
     )
 
-    classifier_parameters = itertools.chain(
-        model.shared.named_parameters(prefix="shared"),
-        model.classifier.named_parameters(prefix="classifier"),
-        model.cls_head.named_parameters(prefix="cls_head"),
-    )
-
     autoencoder_optimizer = bnb.optim.AdamW8bit(
         make_param_groups(autoencoder_parameters, learning_rate, weight_decay)
     )
 
-    classifier_optimizer = bnb.optim.AdamW8bit(
-        make_param_groups(classifier_parameters, learning_rate, weight_decay)
-    )
+    if config.has_classifier:
+        classifier_parameters = itertools.chain(
+            model.shared.named_parameters(prefix="shared"),
+            model.classifier.named_parameters(prefix="classifier"),
+            model.cls_head.named_parameters(prefix="cls_head"),
+        )
+
+        classifier_optimizer = bnb.optim.AdamW8bit(
+            make_param_groups(classifier_parameters, learning_rate, weight_decay)
+        )
 
     pbar = trange(num_train_steps)
     for i in pbar:
@@ -393,6 +400,7 @@ def train_model(
         encoder_latents = encoder_outputs.last_hidden_state
         autoencoder_latent_loss = 0
         if config.is_vae:
+            ### Sample latents
             encoder_latents_mean = model.mean_head(encoder_latents)
             encoder_latents_log_var = model.log_var_head(encoder_latents)
 
@@ -401,6 +409,7 @@ def train_model(
                 0.5 * encoder_latents_log_var
             )
 
+            ### Latent Loss
             autoencoder_latent_loss = standard_normal_log_kl_div(
                 encoder_latents_mean, encoder_latents_log_var
             )
@@ -415,13 +424,11 @@ def train_model(
             autoencoder_latent_loss = torch.mean(autoencoder_latent_loss, dim=0)
 
         ## Decode
-        decoder_outputs: BaseModelOutputWithPastAndCrossAttentions = (
-            model.decoder.forward(
-                input_ids=batch_data["decoder_input_ids"],
-                attention_mask=batch_data["decoder_attention_mask"],
-                encoder_hidden_states=encoder_latents,
-                encoder_attention_mask=batch_data["encoder_attention_mask"],
-            )
+        decoder_outputs: BaseModelOutputWithPastAndCrossAttentions = model.decoder(
+            input_ids=batch_data["decoder_input_ids"],
+            attention_mask=batch_data["decoder_attention_mask"],
+            encoder_hidden_states=encoder_latents,
+            encoder_attention_mask=batch_data["encoder_attention_mask"],
         )
 
         ## Tokens
@@ -433,19 +440,120 @@ def train_model(
             batch_data["decoder_labels"].reshape(-1),
         )
 
+        ## Adversarial classifier loss
+        adversarial_loss = 0
+        if config.has_classifier:
+            model.classifier.requires_grad_(False)
+            model.cls_head.requires_grad_(False)
+
+            classifier_output: BaseModelOutputWithPastAndCrossAttentions = (
+                model.classifier(
+                    inputs_embeds=encoder_latents,
+                    attention_mask=batch_data["encoder_attention_mask"],
+                )
+            )
+
+            classifier_last_hidden_state = classifier_output.last_hidden_state
+
+            ### Pool hidden states
+            classifier_last_hidden_state = classifier_last_hidden_state * batch_data[
+                "encoder_attention_mask"
+            ].reshape(batch_size, max_length, 1)
+            classifier_last_hidden_state = torch.sum(
+                classifier_last_hidden_state, dim=1
+            ) / torch.sum(batch_data["encoder_attention_mask"], dim=1, keepdim=True)
+
+            ### Get logits
+            classifier_logits = model.cls_head(classifier_last_hidden_state)
+
+            ### Adversarial loss
+            adversarial_loss = F.binary_cross_entropy_with_logits(
+                classifier_logits[:, 0], 1 - batch_data["class_label"].float()
+            )
+
+            model.classifier.requires_grad_(True)
+            model.cls_head.requires_grad_(True)
+
         ## Step
-        loss = autoencoder_reconstruction_loss + 0.1 * autoencoder_latent_loss
+        loss = (
+            autoencoder_reconstruction_loss
+            + 0.01 * autoencoder_latent_loss
+            + adversarial_loss
+        )
 
         autoencoder_optimizer.zero_grad(set_to_none=True)
         loss.backward()
         autoencoder_optimizer.step()
+
+        # Classifier step
+        classifier_loss = 0
+        if config.has_classifier:
+            ## Get new batch
+            batch_data = next(train_dataloader_iter)
+            batch_data = tensor_dict_to_device(batch_data, device)
+
+            ## Get encoder latents
+            with torch.no_grad():
+                ## Encode
+                encoder_outputs: BaseModelOutputWithPastAndCrossAttentions = (
+                    model.encoder(
+                        batch_data["encoder_input_ids"],
+                        batch_data["encoder_attention_mask"],
+                    )
+                )
+
+                ## Latents
+                encoder_latents = encoder_outputs.last_hidden_state
+                if config.is_vae:
+                    ### Sample latents
+                    encoder_latents_mean = model.mean_head(encoder_latents)
+                    encoder_latents_log_var = model.log_var_head(encoder_latents)
+
+                    encoder_latents_noise = torch.randn_like(encoder_latents_mean)
+                    encoder_latents = (
+                        encoder_latents_mean
+                        + encoder_latents_noise
+                        * torch.exp(0.5 * encoder_latents_log_var)
+                    )
+
+            ## Classify latents
+            classifier_output: BaseModelOutputWithPastAndCrossAttentions = (
+                model.classifier(
+                    inputs_embeds=encoder_latents,
+                    attention_mask=batch_data["encoder_attention_mask"],
+                )
+            )
+
+            classifier_last_hidden_state = classifier_output.last_hidden_state
+
+            ### Pool hidden states
+            classifier_last_hidden_state = classifier_last_hidden_state * batch_data[
+                "encoder_attention_mask"
+            ].reshape(batch_size, max_length, 1)
+            classifier_last_hidden_state = torch.sum(
+                classifier_last_hidden_state, dim=1
+            ) / torch.sum(batch_data["encoder_attention_mask"], dim=1, keepdim=True)
+
+            ### Get logits
+            classifier_logits = model.cls_head(classifier_last_hidden_state)
+
+            ### Classifier loss
+            classifier_loss = F.binary_cross_entropy_with_logits(
+                classifier_logits[:, 0], batch_data["class_label"].float()
+            )
+
+            loss = classifier_loss
+
+            classifier_optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            classifier_optimizer.step()
 
         if (i + 1) % save_interval == 0:
             model.save_pretrained(model_path)
             tokenizer.save(f"{model_path}/tokenizer.json")
 
         pbar.set_postfix_str(
-            f"AE: {autoencoder_reconstruction_loss:.2e} Z: {autoencoder_latent_loss:.2e}"
+            f"AE: {autoencoder_reconstruction_loss:.2e} Z: {autoencoder_latent_loss:.2e} ADV: {adversarial_loss:.2e} CLS: {classifier_loss:.2e}"
         )
 
 
@@ -481,7 +589,7 @@ def main_train():
     config = UTT5Config(**base_config.to_dict())
 
     ## Directories
-    model_path = "results/varaegan/models/2024-04-13_vocab1024_t5tiny"
+    model_path = "results/varaegan/models/2024-04-14_vocab1024_t5tiny"
     tokenizer_path = "results/varaegan/tokenizers/2024-04-13_vocab1024"
 
     language0_wikisentence_path = "data/eng_wikipedia_2016_1M-sentences.txt"
@@ -554,7 +662,7 @@ def main_eval():
             penalty_alpha=0.6,
             top_k=4,
             forced_bos_token_id=(
-                language0_token_id if target_language == 0 else language1_token_id
+                language0_token_id if target_language == "0" else language1_token_id
             ),
         )
 
