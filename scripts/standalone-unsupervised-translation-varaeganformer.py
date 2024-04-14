@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm as tq
 from tqdm import trange
 from transformers import GenerationConfig
+from transformers.generation import GenerateEncoderDecoderOutput
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from transformers.models.t5.modeling_t5 import (
     T5Config,
@@ -175,8 +176,17 @@ def make_param_groups(
     return [base_group, no_wd_group]
 
 
-def tensor_dict_to_device(tensor_dict: Dict[str, torch.Tensor], device: str):
-    return {key: tensor.to(device) for key, tensor in tensor_dict.items()}
+def tensor_dict_to_device(
+    tensor_dict: Dict[str, torch.Tensor], device: str, dtype: torch.dtype
+):
+    return {
+        key: (
+            tensor.to(device=device, dtype=dtype)
+            if tensor.dtype.is_floating_point
+            else tensor.to(device=device)
+        )
+        for key, tensor in tensor_dict.items()
+    }
 
 
 def train_tokenizer(dataset: datasets.Dataset, vocab_size: int):
@@ -226,6 +236,7 @@ def train_model(
     max_length = 32
     num_train_steps = 100000
     device = "cuda"
+    dtype = config.torch_dtype
 
     save_interval = 100
 
@@ -354,7 +365,7 @@ def train_model(
 
     # Create model
     model = T5ForUnsupervisedTranslation(config)
-    model = model.to(device)  # type: ignore
+    model = model.to(device=device, dtype=dtype)  # type: ignore
     model.train()
     model.gradient_checkpointing_enable()
 
@@ -389,7 +400,7 @@ def train_model(
 
         ## Get new batch
         batch_data = next(train_dataloader_iter)
-        batch_data = tensor_dict_to_device(batch_data, device)
+        batch_data = tensor_dict_to_device(batch_data, device, dtype)
 
         ## Encode
         encoder_outputs: BaseModelOutputWithPastAndCrossAttentions = model.encoder(
@@ -440,7 +451,7 @@ def train_model(
             batch_data["decoder_labels"].reshape(-1),
         )
 
-        ## Adversarial classifier loss
+        ## Adversarial
         adversarial_loss = 0
         if config.has_classifier:
             model.classifier.requires_grad_(False)
@@ -490,7 +501,7 @@ def train_model(
         if config.has_classifier:
             ## Get new batch
             batch_data = next(train_dataloader_iter)
-            batch_data = tensor_dict_to_device(batch_data, device)
+            batch_data = tensor_dict_to_device(batch_data, device, dtype)
 
             ## Get encoder latents
             with torch.no_grad():
@@ -619,7 +630,7 @@ def main_train():
 
 @torch.no_grad
 def main_eval():
-    model_path = "results/varaegan/models/2024-04-13_vocab1024_t5tiny"
+    model_path = "results/varaegan/models/2024-04-14_vocab1024_t5tiny"
     tokenizer_path = "results/varaegan/tokenizers/2024-04-13_vocab1024"
     device = "cuda"
 
@@ -678,5 +689,5 @@ def main_eval():
 
 
 if __name__ == "__main__":
-    main_train()
-    # main_eval()
+    # main_train()
+    main_eval()
