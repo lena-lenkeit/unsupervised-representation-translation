@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, default_collate
 from tqdm import tqdm as tq
 from tqdm import trange
 from transformers import GenerationConfig
@@ -362,12 +362,14 @@ def train_model(
     config.pad_token_id = pad_token_id
     config.bos_token_id = bos_token_id
     config.eos_token_id = eos_token_id
+    config.use_cache = True
 
     # Create model
     model = T5ForUnsupervisedTranslation(config)
-    model = model.to(device=device, dtype=dtype)  # type: ignore
+    model: T5ForUnsupervisedTranslation = model.to(device=device, dtype=dtype)  # type: ignore
     model.train()
     model.gradient_checkpointing_enable()
+    model.config.use_cache = False
 
     # Create optimizers
     autoencoder_parameters = itertools.chain(
@@ -394,6 +396,175 @@ def train_model(
             make_param_groups(classifier_parameters, learning_rate, weight_decay)
         )
 
+    def encode(
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        include_loss: bool = False,
+    ):
+        # Encode
+        outputs: BaseModelOutputWithPastAndCrossAttentions = model.encoder(
+            input_ids=input_ids, attention_mask=attention_mask
+        )
+
+        # Latents
+        latents = outputs.last_hidden_state
+        latent_loss = 0.0
+
+        if config.is_vae:
+            # Sample latents
+            latents_mean = model.mean_head(latents)
+            latents_log_var = model.log_var_head(latents)
+
+            latents_noise = torch.randn_like(latents_mean)
+            latents = latents_mean + latents_noise * torch.exp(0.5 * latents_log_var)
+
+            # Latent Loss
+            if include_loss:
+                latent_loss = standard_normal_log_kl_div(latents_mean, latents_log_var)
+
+                # Mask loss
+                latent_loss = latent_loss * attention_mask[..., None]
+                # Sum over latent features
+                latent_loss = torch.sum(latent_loss, dim=2)
+                # Manual mean over tokens
+                num_tokens = torch.sum(attention_mask, dim=1)
+                latent_loss = torch.sum(latent_loss, dim=1) / num_tokens
+                # Mean over batch
+                latent_loss = torch.mean(latent_loss, dim=0)
+
+        return outputs, latents, latent_loss
+
+    def decode(
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        encoder_latents: torch.Tensor,
+        encoder_attention_mask: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        include_loss: bool = False,
+    ):
+        # Outputs
+        outputs: BaseModelOutputWithPastAndCrossAttentions = model.decoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            encoder_hidden_states=encoder_latents,
+            encoder_attention_mask=encoder_attention_mask,
+        )
+
+        # Logits
+        logits: torch.Tensor = model.lm_head(outputs.last_hidden_state)
+
+        # Loss
+        reconstruction_loss = 0.0
+        if include_loss:
+            assert labels is not None
+
+            reconstruction_loss = F.cross_entropy(
+                logits.reshape(-1, config.vocab_size), labels.reshape(-1)
+            )
+
+        return outputs, logits, reconstruction_loss
+
+    def classify(
+        latents: torch.Tensor,
+        attention_mask: torch.Tensor,
+        label: torch.Tensor | None = None,
+        include_loss: bool = False,
+    ):
+        # Classify latents
+        output: BaseModelOutputWithPastAndCrossAttentions = model.classifier(
+            inputs_embeds=latents,
+            attention_mask=attention_mask,
+        )
+
+        last_hidden_state = output.last_hidden_state
+
+        # Pool hidden states
+        last_hidden_state = last_hidden_state * attention_mask[..., None]
+        num_tokens = torch.sum(attention_mask, dim=1, keepdim=True)
+        last_hidden_state = torch.sum(last_hidden_state, dim=1) / num_tokens
+
+        # Logits
+        logits = model.cls_head(last_hidden_state)
+
+        # Loss
+        loss = 0.0
+        if include_loss:
+            assert label is not None
+
+            loss = F.binary_cross_entropy_with_logits(logits[:, 0], label.float())
+
+        return output, logits, loss
+
+    def sample(
+        encoder_latents: torch.Tensor,
+        encoder_attention_mask: torch.Tensor,
+        target_label: torch.Tensor,
+    ):
+        sample_language_token_id = torch.where(
+            target_label == 0, language0_token_id, language1_token_id
+        )
+        sample_language_token_id = sample_language_token_id.cpu().numpy().tolist()
+
+        generation_config = GenerationConfig(
+            max_length=max_length,
+            penalty_alpha=0.6,
+            top_k=4,
+            forced_bos_token_id=sample_language_token_id,
+        )
+
+        model.gradient_checkpointing_disable()
+        model.config.use_cache = True
+        generation_output: torch.Tensor = model.generate(
+            encoder_outputs=BaseModelOutputWithPastAndCrossAttentions(
+                last_hidden_state=encoder_latents
+            ),
+            attention_mask=encoder_attention_mask,
+            generation_config=generation_config,
+        )
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable()
+
+        return generation_output
+
+    def samples_to_batch(
+        generation_output: torch.Tensor, labels: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        # Convert from torch back to python objects
+        label_list = labels.cpu().numpy().tolist()
+        token_ids_list = generation_output.cpu().numpy().tolist()
+
+        batch_inputs = []
+
+        # Process each token sequence into a training data point
+        token_ids: List[int]
+        label: int
+        for token_ids, label in zip(token_ids_list, label_list):
+            start_index = 2  # [BOS] [LABEL_X] Text Token Ids [EOS] [PAD] ...
+            end_index = -1
+
+            try:
+                end_index = token_ids.index(eos_token_id)
+            except ValueError:
+                pass
+
+            # Extract text tokens from generated tokens
+            text_token_ids = token_ids[start_index:end_index]
+
+            # Make inputs
+            inputs = make_inputs_fn({"token_ids": text_token_ids, "label": label})
+            inputs = {
+                k: (
+                    torch.LongTensor(v)
+                    if isinstance(v, list)
+                    else torch.scalar_tensor(label, dtype=torch.int64)
+                )
+                for k, v in inputs.items()
+            }
+            batch_inputs.append(inputs)
+
+        # Collate back to torch training batch
+        return default_collate(batch_inputs)
+
     pbar = trange(num_train_steps)
     for i in pbar:
         # Autoencoder step
@@ -403,52 +574,20 @@ def train_model(
         batch_data = tensor_dict_to_device(batch_data, device, dtype)
 
         ## Encode
-        encoder_outputs: BaseModelOutputWithPastAndCrossAttentions = model.encoder(
-            batch_data["encoder_input_ids"], batch_data["encoder_attention_mask"]
+        encoder_outputs, encoder_latents, latent_loss = encode(
+            batch_data["encoder_input_ids"],
+            batch_data["encoder_attention_mask"],
+            include_loss=True,
         )
-
-        ## Latents
-        encoder_latents = encoder_outputs.last_hidden_state
-        autoencoder_latent_loss = 0
-        if config.is_vae:
-            ### Sample latents
-            encoder_latents_mean = model.mean_head(encoder_latents)
-            encoder_latents_log_var = model.log_var_head(encoder_latents)
-
-            encoder_latents_noise = torch.randn_like(encoder_latents_mean)
-            encoder_latents = encoder_latents_mean + encoder_latents_noise * torch.exp(
-                0.5 * encoder_latents_log_var
-            )
-
-            ### Latent Loss
-            autoencoder_latent_loss = standard_normal_log_kl_div(
-                encoder_latents_mean, encoder_latents_log_var
-            )
-            autoencoder_latent_loss = autoencoder_latent_loss * batch_data[
-                "encoder_attention_mask"
-            ].reshape(batch_size, max_length, 1)
-
-            autoencoder_latent_loss = torch.sum(autoencoder_latent_loss, dim=2)
-            autoencoder_latent_loss = torch.sum(
-                autoencoder_latent_loss, dim=1
-            ) / torch.sum(batch_data["encoder_attention_mask"], dim=1)
-            autoencoder_latent_loss = torch.mean(autoencoder_latent_loss, dim=0)
 
         ## Decode
-        decoder_outputs: BaseModelOutputWithPastAndCrossAttentions = model.decoder(
-            input_ids=batch_data["decoder_input_ids"],
-            attention_mask=batch_data["decoder_attention_mask"],
-            encoder_hidden_states=encoder_latents,
-            encoder_attention_mask=batch_data["encoder_attention_mask"],
-        )
-
-        ## Tokens
-        decoder_token_logits = model.lm_head(decoder_outputs.last_hidden_state)
-
-        ## Reconstruction loss
-        autoencoder_reconstruction_loss = F.cross_entropy(
-            decoder_token_logits.reshape(-1, config.vocab_size),
-            batch_data["decoder_labels"].reshape(-1),
+        decoder_outputs, decoder_logits, reconstruction_loss = decode(
+            batch_data["decoder_input_ids"],
+            batch_data["decoder_attention_mask"],
+            encoder_latents,
+            batch_data["encoder_attention_mask"],
+            batch_data["decoder_labels"],
+            include_loss=True,
         )
 
         ## Adversarial
@@ -457,38 +596,70 @@ def train_model(
             model.classifier.requires_grad_(False)
             model.cls_head.requires_grad_(False)
 
-            classifier_output: BaseModelOutputWithPastAndCrossAttentions = (
-                model.classifier(
-                    inputs_embeds=encoder_latents,
-                    attention_mask=batch_data["encoder_attention_mask"],
-                )
-            )
-
-            classifier_last_hidden_state = classifier_output.last_hidden_state
-
-            ### Pool hidden states
-            classifier_last_hidden_state = classifier_last_hidden_state * batch_data[
-                "encoder_attention_mask"
-            ].reshape(batch_size, max_length, 1)
-            classifier_last_hidden_state = torch.sum(
-                classifier_last_hidden_state, dim=1
-            ) / torch.sum(batch_data["encoder_attention_mask"], dim=1, keepdim=True)
-
-            ### Get logits
-            classifier_logits = model.cls_head(classifier_last_hidden_state)
-
-            ### Adversarial loss
-            adversarial_loss = F.binary_cross_entropy_with_logits(
-                classifier_logits[:, 0], 1 - batch_data["class_label"].float()
+            classifier_outputs, classifier_logits, adversarial_loss = classify(
+                encoder_latents,
+                batch_data["encoder_attention_mask"],
+                1 - batch_data["class_label"],
+                include_loss=True,
             )
 
             model.classifier.requires_grad_(True)
             model.cls_head.requires_grad_(True)
 
+        ## Backtranslation
+        bt_latent_loss = 0.0
+        bt_reconstruction_loss = 0.0
+        if config.do_backtranslation:
+            ### Get new batch
+            source_batch_data = next(train_dataloader_iter)
+            source_batch_data = tensor_dict_to_device(source_batch_data, device, dtype)
+
+            with torch.no_grad():
+                ### Encode
+                encoder_outputs, encoder_latents, _ = encode(
+                    source_batch_data["encoder_input_ids"],
+                    source_batch_data["encoder_attention_mask"],
+                    include_loss=False,
+                )
+
+                ### Sample
+                generation_output = sample(
+                    encoder_latents,
+                    source_batch_data["encoder_attention_mask"],
+                    1 - source_batch_data["class_label"],
+                )
+
+                ### To new batch
+                translated_batch_data = samples_to_batch(
+                    generation_output, source_batch_data["class_label"]
+                )
+                translated_batch_data = tensor_dict_to_device(
+                    translated_batch_data, device, dtype
+                )
+
+            ## Encode
+            encoder_outputs, encoder_latents, bt_latent_loss = encode(
+                translated_batch_data["encoder_input_ids"],
+                translated_batch_data["encoder_attention_mask"],
+                include_loss=True,
+            )
+
+            ## Decode
+            decoder_outputs, decoder_logits, bt_reconstruction_loss = decode(
+                source_batch_data["decoder_input_ids"],
+                source_batch_data["decoder_attention_mask"],
+                encoder_latents,
+                translated_batch_data["encoder_attention_mask"],
+                source_batch_data["decoder_labels"],
+                include_loss=True,
+            )
+
         ## Step
         loss = (
-            autoencoder_reconstruction_loss
-            + 0.01 * autoencoder_latent_loss
+            reconstruction_loss
+            + bt_reconstruction_loss
+            + 0.01 * latent_loss
+            + 0.01 * bt_latent_loss
             + adversarial_loss
         )
 
@@ -503,54 +674,20 @@ def train_model(
             batch_data = next(train_dataloader_iter)
             batch_data = tensor_dict_to_device(batch_data, device, dtype)
 
-            ## Get encoder latents
+            ## Encode
             with torch.no_grad():
-                ## Encode
-                encoder_outputs: BaseModelOutputWithPastAndCrossAttentions = (
-                    model.encoder(
-                        batch_data["encoder_input_ids"],
-                        batch_data["encoder_attention_mask"],
-                    )
+                encoder_outputs, encoder_latents, latent_loss = encode(
+                    batch_data["encoder_input_ids"],
+                    batch_data["encoder_attention_mask"],
+                    include_loss=True,
                 )
 
-                ## Latents
-                encoder_latents = encoder_outputs.last_hidden_state
-                if config.is_vae:
-                    ### Sample latents
-                    encoder_latents_mean = model.mean_head(encoder_latents)
-                    encoder_latents_log_var = model.log_var_head(encoder_latents)
-
-                    encoder_latents_noise = torch.randn_like(encoder_latents_mean)
-                    encoder_latents = (
-                        encoder_latents_mean
-                        + encoder_latents_noise
-                        * torch.exp(0.5 * encoder_latents_log_var)
-                    )
-
-            ## Classify latents
-            classifier_output: BaseModelOutputWithPastAndCrossAttentions = (
-                model.classifier(
-                    inputs_embeds=encoder_latents,
-                    attention_mask=batch_data["encoder_attention_mask"],
-                )
-            )
-
-            classifier_last_hidden_state = classifier_output.last_hidden_state
-
-            ### Pool hidden states
-            classifier_last_hidden_state = classifier_last_hidden_state * batch_data[
-                "encoder_attention_mask"
-            ].reshape(batch_size, max_length, 1)
-            classifier_last_hidden_state = torch.sum(
-                classifier_last_hidden_state, dim=1
-            ) / torch.sum(batch_data["encoder_attention_mask"], dim=1, keepdim=True)
-
-            ### Get logits
-            classifier_logits = model.cls_head(classifier_last_hidden_state)
-
-            ### Classifier loss
-            classifier_loss = F.binary_cross_entropy_with_logits(
-                classifier_logits[:, 0], batch_data["class_label"].float()
+            ## Classify
+            classifier_outputs, classifier_logits, classifier_loss = classify(
+                encoder_latents,
+                batch_data["encoder_attention_mask"],
+                batch_data["class_label"],
+                include_loss=True,
             )
 
             loss = classifier_loss
@@ -560,11 +697,14 @@ def train_model(
             classifier_optimizer.step()
 
         if (i + 1) % save_interval == 0:
+            model.config.use_cache = True
             model.save_pretrained(model_path)
+            model.config.use_cache = False
+
             tokenizer.save(f"{model_path}/tokenizer.json")
 
         pbar.set_postfix_str(
-            f"AE: {autoencoder_reconstruction_loss:.2e} Z: {autoencoder_latent_loss:.2e} ADV: {adversarial_loss:.2e} CLS: {classifier_loss:.2e}"
+            f"AE: {reconstruction_loss:.2e} Z: {latent_loss:.2e} BT-AE: {bt_reconstruction_loss:.2e} BT-Z: {bt_latent_loss:.2e} ADV: {adversarial_loss:.2e} CLS: {classifier_loss:.2e}"
         )
 
 
@@ -597,10 +737,12 @@ def main_train():
     base_config = T5Config(
         feed_forward_proj="gated-silu", is_gated_act=True, dense_act_fn="silu"
     )
-    config = UTT5Config(**base_config.to_dict())
+    config = UTT5Config(
+        has_classifier=False, do_backtranslation=True, **base_config.to_dict()
+    )
 
     ## Directories
-    model_path = "results/varaegan/models/2024-04-14_vocab1024_t5tiny"
+    model_path = "results/varaegan/models/2024-04-14_vocab1024_t5tiny_bt_noadv"
     tokenizer_path = "results/varaegan/tokenizers/2024-04-13_vocab1024"
 
     language0_wikisentence_path = "data/eng_wikipedia_2016_1M-sentences.txt"
@@ -689,5 +831,5 @@ def main_eval():
 
 
 if __name__ == "__main__":
-    # main_train()
-    main_eval()
+    main_train()
+    # main_eval()
