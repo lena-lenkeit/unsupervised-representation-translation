@@ -117,6 +117,27 @@ class T5ForUnsupervisedTranslation(T5ForConditionalGeneration):
             if self.config.has_classifier:
                 self._tie_or_clone_weights(self.classifier.embed_tokens, self.shared)
 
+    def _init_weights(self, module):
+        factor = self.config.initializer_factor
+        if isinstance(module, T5ForUnsupervisedTranslation):
+            print("Initializing UTT5")
+            if module.config.is_vae:
+                print("Initializing VAE heads")
+                module.mean_head.weight.data.normal_(
+                    mean=0.0, std=factor * ((self.config.d_model) ** -0.5)
+                )
+                module.log_var_head.weight.data.normal_(
+                    mean=0.0, std=factor * ((self.config.d_model) ** -0.5)
+                )
+            if module.config.has_classifier:
+                print("Initializing CLS head")
+                module.cls_head.weight.data.normal_(
+                    mean=0.0, std=factor * ((self.config.d_model) ** -0.5)
+                )
+        else:
+            print("Initializing T5")
+            super()._init_weights(module)
+
 
 def standard_normal_log_kl_div(mean: torch.Tensor, log_var: torch.Tensor):
     return 0.5 * (torch.exp(log_var) + torch.square(mean) - 1 - log_var)
