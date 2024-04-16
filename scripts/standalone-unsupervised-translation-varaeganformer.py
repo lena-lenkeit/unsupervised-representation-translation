@@ -258,6 +258,7 @@ def train_model(
     num_train_steps = 100000
     device = "cuda"
     dtype = config.torch_dtype
+    ae_pretrain_steps = 2500
 
     save_interval = 100
 
@@ -595,7 +596,7 @@ def train_model(
         return default_collate(batch_inputs)
 
     pbar = trange(num_train_steps)
-    for i in pbar:
+    for step_id in pbar:
         # Autoencoder step
 
         ## Get new batch
@@ -638,7 +639,7 @@ def train_model(
         ## Backtranslation
         bt_latent_loss = 0.0
         bt_reconstruction_loss = 0.0
-        if config.do_backtranslation:
+        if config.do_backtranslation and step_id >= ae_pretrain_steps:
             ### Get new batch
             source_batch_data = next(train_dataloader_iter)
             source_batch_data = tensor_dict_to_device(source_batch_data, device, dtype)
@@ -725,7 +726,7 @@ def train_model(
             loss.backward()
             classifier_optimizer.step()
 
-        if (i + 1) % save_interval == 0:
+        if (step_id + 1) % save_interval == 0:
             model.config.use_cache = True
             model.save_pretrained(model_path)
             model.config.use_cache = False
