@@ -393,14 +393,22 @@ def train_model(
     model.config.use_cache = False
 
     # Create optimizers
-    autoencoder_parameters = itertools.chain(
+    autoencoder_parameters = [
         model.shared.named_parameters(prefix="shared"),
         model.encoder.named_parameters(prefix="encoder"),
         model.decoder.named_parameters(prefix="decoder"),
-        model.mean_head.named_parameters(prefix="mean_head"),
-        model.log_var_head.named_parameters(prefix="log_var_head"),
         model.lm_head.named_parameters(prefix="lm_head"),
-    )
+    ]
+
+    if config.is_vae:
+        autoencoder_parameters.extend(
+            [
+                model.mean_head.named_parameters(prefix="mean_head"),
+                model.log_var_head.named_parameters(prefix="log_var_head"),
+            ]
+        )
+
+    autoencoder_parameters = itertools.chain(*autoencoder_parameters)
 
     autoencoder_optimizer = bnb.optim.AdamW8bit(
         make_param_groups(autoencoder_parameters, learning_rate, weight_decay)
