@@ -67,7 +67,8 @@ class T5ForUnsupervisedTranslation(T5ForConditionalGeneration):
         super(T5PreTrainedModel, self).__init__(config)
         self.model_dim = config.d_model
 
-        self.shared = bnb.nn.StableEmbedding(config.vocab_size, config.d_model)
+        # self.shared = bnb.nn.StableEmbedding(config.vocab_size, config.d_model)
+        self.shared = bnb.nn.Embedding(config.vocab_size, config.d_model)
 
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
@@ -121,6 +122,13 @@ class T5ForUnsupervisedTranslation(T5ForConditionalGeneration):
         factor = self.config.initializer_factor
         if isinstance(module, T5ForUnsupervisedTranslation):
             print("Initializing UTT5")
+            module.encoder.embed_tokens.weight.data.normal_(mean=0.0, std=1e-4)
+            module.decoder.embed_tokens.weight.data.normal_(mean=0.0, std=1e-4)
+            if module.config.has_classifier:
+                module.classifier.embed_tokens.weight.data.normal_(mean=0.0, std=1e-4)
+            module.lm_head.weight.data.normal_(mean=0.0, std=1e-4)
+            module.shared.weight.data.normal_(mean=0.0, std=1e-4)
+            # module.shared.norm.reset_parameters()
             if module.config.is_vae:
                 print("Initializing VAE heads")
                 module.mean_head.weight.data.normal_(
