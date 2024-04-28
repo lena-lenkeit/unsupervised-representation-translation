@@ -904,6 +904,33 @@ def main_eval():
         generation_output = generation_output.cpu().numpy().tolist()[0]
         print(tokenizer.decode(generation_output, skip_special_tokens=False))
 
+        # Decoder loss
+        decoder_input_ids = (
+            [bos_token_id, language_token_id] + encoding.ids[: 32 - 3] + [eos_token_id]
+        )
+        decoder_labels = [-100] + encoding.ids[: 32 - 3] + [eos_token_id, -100]
+
+        decoder_input_ids = torch.LongTensor([decoder_input_ids]).to(device)
+        decoder_labels = torch.LongTensor([decoder_labels]).to(device)
+
+        # Outputs
+        outputs: BaseModelOutputWithPastAndCrossAttentions = model.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=torch.ones_like(decoder_input_ids),
+            encoder_hidden_states=encoder_latents,
+            encoder_attention_mask=torch.ones_like(encoder_input_ids),
+        )
+
+        # Logits
+        logits: torch.Tensor = model.lm_head(outputs.last_hidden_state)
+
+        # Loss
+        reconstruction_loss = F.cross_entropy(
+            logits.reshape(-1, tokenizer.get_vocab_size()), decoder_labels.reshape(-1)
+        )
+
+        print(reconstruction_loss)
+
 
 if __name__ == "__main__":
     main_train()
