@@ -235,7 +235,7 @@ def train_tokenizer(dataset: datasets.Dataset, vocab_size: int):
         vocab_size=vocab_size,
         show_progress=True,
         initial_alphabet=tokenizers.pre_tokenizers.ByteLevel.alphabet(),
-        special_tokens=["[PAD]", "[BOS]", "[EOS]", "[LABEL_0]", "[LABEL_1]"],
+        special_tokens=["[PAD]", "[BOS]", "[EOS]", "[MASK]", "[LABEL_0]", "[LABEL_1]"],
     )  # type: ignore
 
     # Make iterator
@@ -346,6 +346,43 @@ def train_model(
             "decoder_labels": decoder_labels,
             "class_label": label,
         }
+
+    def corrupt_tokens_fn(
+        row: Dict[str, Any],
+        mask_token_id: int,
+        mask_prob: float,
+        randomize_prob: float,
+        shuffle_prob: float,
+        shuffle_max_range: int,
+    ):
+        token_ids = row["token_ids"]
+        token_ids = np.asarray(token_ids, dtype=np.int64)
+        corrupted_token_ids = token_ids.copy()
+
+        # Shuffle tokens by selecting among nearby tokens
+        random_offsets = np.random.randint(
+            -shuffle_max_range, shuffle_max_range + 1, size=len(token_ids)
+        )
+        random_idx = (np.arange(len(token_ids)) + random_offsets) % len(token_ids)
+        random_token_ids = token_ids[random_idx]
+        random_mask = np.random.rand(len(token_ids)) < shuffle_prob
+        corrupted_token_ids = np.where(
+            random_mask, random_token_ids, corrupted_token_ids
+        )
+
+        # Randomize tokens by selecting among random token ids across the entire context
+        random_idx = np.random.randint(len(token_ids), size=len(token_ids))
+        random_token_ids = token_ids[random_idx]
+        random_mask = np.random.rand(len(token_ids)) < randomize_prob
+        corrupted_token_ids = np.where(
+            random_mask, random_token_ids, corrupted_token_ids
+        )
+
+        # Randomly mask tokens
+        random_mask = np.random.rand(len(token_ids)) < mask_prob
+        corrupted_token_ids = np.where(random_mask, mask_token_id, corrupted_token_ids)
+
+        return {"corrupted_token_ids": corrupted_token_ids.tolist()}
 
     language0_dataset = language0_dataset.shuffle().flatten_indices(keep_in_memory=True)
     language1_dataset = language1_dataset.shuffle().flatten_indices(keep_in_memory=True)
