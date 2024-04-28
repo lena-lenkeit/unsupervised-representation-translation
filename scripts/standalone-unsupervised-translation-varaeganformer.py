@@ -5,6 +5,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import bitsandbytes as bnb
 import datasets
+import numpy as np
+import safetensors
+import safetensors.torch
 import tokenizers
 import tokenizers.decoders
 import tokenizers.models
@@ -15,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import x_transformers as xt
 from torch.utils.data import DataLoader, default_collate
 from tqdm import tqdm as tq
 from tqdm import trange
@@ -147,6 +151,60 @@ class T5ForUnsupervisedTranslation(T5ForConditionalGeneration):
             super()._init_weights(module)
 
 
+class XTransformerForUnsupervisedTranslation(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.x_transformer = xt.XTransformer(**kwargs)
+        self.mean_head = nn.Linear(kwargs["dim"], kwargs["dim"], bias=False)
+        self.log_var_head = nn.Linear(kwargs["dim"], kwargs["dim"], bias=False)
+
+        self.x_transformer.encoder.token_emb.emb = bnb.nn.Embedding(
+            kwargs["enc_num_tokens"], kwargs["dim"]
+        )
+
+        self.x_transformer.decoder.net.token_emb.emb = bnb.nn.Embedding(
+            kwargs["dec_num_tokens"], kwargs["dim"]
+        )
+
+    def encoder(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> BaseModelOutputWithPastAndCrossAttentions:
+        last_hidden_state = self.x_transformer.encoder(
+            input_ids,
+            mask=attention_mask.bool(),
+            return_embeddings=True,
+        )
+        return BaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=last_hidden_state
+        )
+
+    def decoder(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor,
+    ) -> BaseModelOutputWithPastAndCrossAttentions:
+
+        last_hidden_state = self.x_transformer.decoder.net(
+            input_ids,
+            mask=attention_mask.bool(),
+            context=encoder_hidden_states,
+            context_mask=encoder_attention_mask.bool(),
+            return_embeddings=True,
+        )
+        return BaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=last_hidden_state
+        )
+
+    def lm_head(self, x: torch.Tensor) -> torch.Tensor:
+        return self.x_transformer.decoder.net.to_logits(x)
+
+
 def standard_normal_log_kl_div(mean: torch.Tensor, log_var: torch.Tensor):
     return 0.5 * (torch.exp(log_var) + torch.square(mean) - 1 - log_var)
 
@@ -159,8 +217,8 @@ def filter_weight_decay(named_params: Iterable[Tuple[str, nn.Parameter]]):
         apply_weight_decay = True
 
         # No weight decay for all bias terms
-        if "bias" in n:
-            apply_weight_decay = False
+        # if "bias" in n:
+        #    apply_weight_decay = False
 
         # No weight decay for all layer norms
         if "norm" in n:
@@ -218,6 +276,15 @@ def tensor_dict_to_device(
     }
 
 
+def with_prefixes(d: dict, prefixes: List[str]):
+    pd = {}
+
+    for prefix in prefixes:
+        pd.update({prefix + k: v for k, v in d.items()})
+
+    return pd
+
+
 def train_tokenizer(dataset: datasets.Dataset, vocab_size: int):
     # Build tokenizer
     tokenizer = tokenizers.Tokenizer(tokenizers.models.BPE())
@@ -266,7 +333,7 @@ def train_model(
     num_train_steps = 100000
     device = "cuda"
     dtype = config.torch_dtype
-    ae_pretrain_steps = 2500
+    ae_pretrain_steps = 25000
 
     save_interval = 100
 
@@ -421,6 +488,7 @@ def train_model(
         batch_size,
         pin_memory=True,
         pin_memory_device=device,
+        drop_last=True,
     )
     train_dataloader_iter = iter(train_dataloader)
 
@@ -432,13 +500,36 @@ def train_model(
     config.use_cache = True
 
     # Create model
-    model = T5ForUnsupervisedTranslation(config)
-    model: T5ForUnsupervisedTranslation = model.to(device=device, dtype=dtype)  # type: ignore
+    # model = T5ForUnsupervisedTranslation(config)
+    # model: T5ForUnsupervisedTranslation = model.to(device=device, dtype=dtype)  # type: ignore
+    # model.train()
+    # model.gradient_checkpointing_enable()
+    # model.config.use_cache = False
+
+    kwargs_dict = dict(
+        num_tokens=config.vocab_size,
+        max_seq_len=32,
+        depth=4,
+        heads=8,
+        l2norm_embed=True,
+        ff_glu=True,
+        use_simple_rmsnorm=True,
+        ff_no_bias=True,
+        rotary_pos_emb=True,
+        # rel_pos_bias=True,
+    )
+
+    model = XTransformerForUnsupervisedTranslation(
+        dim=512, **with_prefixes(kwargs_dict, ["enc_", "dec_"])
+    ).to(device=device, dtype=dtype)
     model.train()
-    model.gradient_checkpointing_enable()
-    model.config.use_cache = False
+
+    # safetensors.torch.load_model(model, f"{model_path}/model.safetensors")
+    # model.to(device=device, dtype=dtype)
+    # model.train()
 
     # Create optimizers
+    """
     autoencoder_parameters = [
         model.shared.named_parameters(prefix="shared"),
         model.encoder.named_parameters(prefix="encoder"),
@@ -453,8 +544,10 @@ def train_model(
                 model.log_var_head.named_parameters(prefix="log_var_head"),
             ]
         )
+    """
 
-    autoencoder_parameters = itertools.chain(*autoencoder_parameters)
+    # autoencoder_parameters = itertools.chain(*autoencoder_parameters)
+    autoencoder_parameters = model.named_parameters()
 
     autoencoder_optimizer = bnb.optim.AdamW8bit(
         make_param_groups(autoencoder_parameters, learning_rate, weight_decay)
@@ -582,8 +675,8 @@ def train_model(
 
         generation_config = GenerationConfig(
             max_length=max_length,
-            penalty_alpha=0.6,
-            top_k=4,
+            # penalty_alpha=0.6,
+            # top_k=4,
             forced_bos_token_id=sample_language_token_id,
         )
 
@@ -640,13 +733,25 @@ def train_model(
         # Collate back to torch training batch
         return default_collate(batch_inputs)
 
+    def get_next_batch(train_dataloader_iter):
+        try:
+            batch_data = next(train_dataloader_iter)
+        except StopIteration:
+            train_dataloader_iter = iter(train_dataloader)
+            batch_data = next(train_dataloader_iter)
+
+        batch_data = tensor_dict_to_device(batch_data, device, dtype)
+        return batch_data, train_dataloader_iter
+
     pbar = trange(num_train_steps)
     for step_id in pbar:
         # Autoencoder step
 
         ## Get new batch
-        batch_data = next(train_dataloader_iter)
-        batch_data = tensor_dict_to_device(batch_data, device, dtype)
+        # batch_data = next(train_dataloader_iter)
+        # batch_data = tensor_dict_to_device(batch_data, device, dtype)
+
+        batch_data, train_dataloader_iter = get_next_batch(train_dataloader_iter)
 
         ## Encode
         encoder_outputs, encoder_latents, latent_loss = encode(
@@ -686,8 +791,12 @@ def train_model(
         bt_reconstruction_loss = 0.0
         if config.do_backtranslation and step_id >= ae_pretrain_steps:
             ### Get new batch
-            source_batch_data = next(train_dataloader_iter)
-            source_batch_data = tensor_dict_to_device(source_batch_data, device, dtype)
+            # source_batch_data = next(train_dataloader_iter)
+            # source_batch_data = tensor_dict_to_device(source_batch_data, device, dtype)
+
+            source_batch_data, train_dataloader_iter = get_next_batch(
+                train_dataloader_iter
+            )
 
             with torch.no_grad():
                 ### Encode
@@ -746,8 +855,10 @@ def train_model(
         classifier_loss = 0
         if config.has_classifier:
             ## Get new batch
-            batch_data = next(train_dataloader_iter)
-            batch_data = tensor_dict_to_device(batch_data, device, dtype)
+            # batch_data = next(train_dataloader_iter)
+            # batch_data = tensor_dict_to_device(batch_data, device, dtype)
+
+            batch_data, train_dataloader_iter = get_next_batch(train_dataloader_iter)
 
             ## Encode
             with torch.no_grad():
@@ -772,10 +883,12 @@ def train_model(
             classifier_optimizer.step()
 
         if (step_id + 1) % save_interval == 0:
-            model.config.use_cache = True
-            model.save_pretrained(model_path)
-            model.config.use_cache = False
+            # model.config.use_cache = True
+            # model.save_pretrained(model_path)
+            # model.config.use_cache = False
 
+            os.makedirs(model_path, exist_ok=True)
+            safetensors.torch.save_model(model, f"{model_path}/model.safetensors")
             tokenizer.save(f"{model_path}/tokenizer.json")
 
         pbar.set_postfix_str(
@@ -809,19 +922,76 @@ def main_train():
     # Parameters
 
     ## Config
+
+    # T5-large
+    if False:
+        base_config = T5Config(
+            feed_forward_proj="gated-silu",
+            is_gated_act=True,
+            dense_act_fn="silu",
+            d_ff=2048,
+            d_kv=64,
+            d_model=1024,
+            n_positions=512,
+            num_heads=16,
+            num_layers=24,
+            relative_attention_max_distance=128,
+            relative_attention_num_buckets=32,
+        )
+
+    # T5-small
+    if False:
+        base_config = T5Config(
+            feed_forward_proj="gated-silu",
+            is_gated_act=True,
+            dense_act_fn="silu",
+            d_ff=2048,
+            d_kv=64,
+            d_model=512,
+            n_positions=512,
+            num_heads=8,
+            num_layers=6,
+            relative_attention_max_distance=128,
+            relative_attention_num_buckets=32,
+        )
+
+    # T5-Tiny
     base_config = T5Config(
-        feed_forward_proj="gated-silu", is_gated_act=True, dense_act_fn="silu"
+        feed_forward_proj="gated-silu",
+        is_gated_act=True,
+        dense_act_fn="silu",
+        d_ff=1024,
+        d_kv=64,
+        d_model=256,
+        n_positions=512,
+        num_heads=4,
+        num_layers=1,  # 2
+        relative_attention_max_distance=32,
+        relative_attention_num_buckets=65,
+        tie_word_embeddings=False,  # True
+        dropout_rate=0.0,  # 0.1
     )
+
     config = UTT5Config(
-        has_classifier=False, do_backtranslation=True, **base_config.to_dict()
+        is_vae=True,
+        has_classifier=False,
+        do_backtranslation=False,
+        **base_config.to_dict(),
     )
 
     ## Directories
-    model_path = "results/varaegan/models/2024-04-14_vocab1024_t5tiny_bt_noadv"
-    tokenizer_path = "results/varaegan/tokenizers/2024-04-13_vocab1024"
+    model_path = "results/varaegan/models/2024-04-27-xtransformers_small_hmm_z1e-2"
+    # tokenizer_path = "results/varaegan/tokenizers/2024-04-24_hmm_vocab256"
+    tokenizer_path = "results/varaegan/tokenizers/2024-04-24_hmm_vocab256"
 
-    language0_wikisentence_path = "data/eng_wikipedia_2016_1M-sentences.txt"
-    language1_wikisentence_path = "data/deu_wikipedia_2016_1M-sentences.txt"
+    # language0_wikisentence_path = "data/eng_wikipedia_2016_1M-sentences.txt"
+    # language1_wikisentence_path = "data/deu_wikipedia_2016_1M-sentences.txt"
+
+    # language0_wikisentence_path = "data/simple-bilingual-stories-eng-sentences.txt"
+    # language1_wikisentence_path = "data/simple-bilingual-stories-ger-sentences.txt"
+
+    language0_wikisentence_path = "data/lang1_hmm_state.txt"
+    language1_wikisentence_path = "data/lang1_hmm_output.txt"
 
     ## Training
 
@@ -830,10 +1000,10 @@ def main_train():
 
     # Prepare datasets
     language0_dataset = make_wikisentence_dataset(
-        language0_wikisentence_path, shuffle=False, iterable=False, clean_lines=True
+        language0_wikisentence_path, shuffle=False, iterable=False, clean_lines=False
     )
     language1_dataset = make_wikisentence_dataset(
-        language1_wikisentence_path, shuffle=False, iterable=False, clean_lines=True
+        language1_wikisentence_path, shuffle=False, iterable=False, clean_lines=False
     )
 
     # Load or train tokenizer
@@ -847,18 +1017,41 @@ def main_train():
 
 @torch.no_grad
 def main_eval():
-    model_path = "results/varaegan/models/2024-04-14_vocab1024_t5tiny"
-    tokenizer_path = "results/varaegan/tokenizers/2024-04-13_vocab1024"
+    # model_path = "results/varaegan/models/2024-04-15_vocab1024_t5tiny_weakz_bt_noadv"
+    # tokenizer_path = "results/varaegan/tokenizers/2024-04-13_vocab1024"
+
+    model_path = "results/varaegan/models/2024-04-27-xtransformers_small_hmm_z1e-2"
+    # tokenizer_path = "results/varaegan/tokenizers/2024-04-24_hmm_vocab256"
+    tokenizer_path = model_path
+
     device = "cuda"
+    dtype = torch.float32
 
     # Load model
-    model = T5ForUnsupervisedTranslation.from_pretrained(model_path)
+    # model = T5ForUnsupervisedTranslation.from_pretrained(model_path)
+
     tokenizer: tokenizers.Tokenizer = tokenizers.Tokenizer.from_file(
         f"{tokenizer_path}/tokenizer.json"
     )
 
+    kwargs_dict = dict(
+        num_tokens=tokenizer.get_vocab_size(),
+        max_seq_len=32,
+        depth=4,
+        heads=8,
+        l2norm_embed=True,
+        ff_glu=True,
+        use_simple_rmsnorm=True,
+        ff_no_bias=True,
+        rotary_pos_emb=True,
+    )
+
+    model = XTransformerForUnsupervisedTranslation(
+        dim=512, **with_prefixes(kwargs_dict, ["enc_", "dec_"])
+    ).to(device=device, dtype=dtype)
     model.eval()
-    model = model.to(device)  # type: ignore
+
+    safetensors.torch.load_model(model, f"{model_path}/model.safetensors")
 
     pad_token_id = tokenizer.token_to_id("[PAD]")
     bos_token_id = tokenizer.token_to_id("[BOS]")
@@ -873,35 +1066,83 @@ def main_eval():
 
         # Get latents
         encoding: tokenizers.Encoding = tokenizer.encode(input_text)
-        encoder_input_ids = [bos_token_id] + encoding.ids + [eos_token_id]
+        encoder_input_ids = [bos_token_id] + encoding.ids[:30] + [eos_token_id]
         encoder_input_ids = torch.LongTensor([encoder_input_ids]).to(device)
 
         encoder_outputs: BaseModelOutputWithPastAndCrossAttentions = model.encoder(
-            input_ids=encoder_input_ids
+            input_ids=encoder_input_ids,
+            attention_mask=torch.ones_like(encoder_input_ids),
         )
         encoder_latents = encoder_outputs.last_hidden_state
-        if model.config.is_vae:
-            encoder_latents_mean = model.mean_head(encoder_latents)
-            encoder_latents = encoder_latents_mean
+        # if model.config.is_vae:
+        # encoder_latents_mean = model.mean_head(encoder_latents)
+        # encoder_latents = encoder_latents_mean
+
+        # Sample latents
+        latents = encoder_latents
+        latents_mean = model.mean_head(latents)
+        latents_log_var = model.log_var_head(latents)
+
+        latents_noise = torch.randn_like(latents_mean)
+        latents = latents_mean + latents_noise * torch.exp(0.5 * latents_log_var)
+        encoder_latents = latents
 
         # Generate
-        generation_config = GenerationConfig(
-            max_new_tokens=128,
-            penalty_alpha=0.6,
-            top_k=4,
-            forced_bos_token_id=(
-                language0_token_id if target_language == "0" else language1_token_id
-            ),
+        # generation_config = GenerationConfig(
+        #    max_new_tokens=128,
+        #    penalty_alpha=0.6,
+        #    top_k=4,
+        #    forced_bos_token_id=(
+        #        language0_token_id if target_language == "0" else language1_token_id
+        #    ),
+        # )
+
+        # generation_config = GenerationConfig(
+        #    max_new_tokens=128,
+        #    do_sample=True,
+        #    top_k=0,
+        #    top_p=0.95,
+        #    forced_bos_token_id=(
+        #        language0_token_id if target_language == "0" else language1_token_id
+        #    ),
+        # )
+
+        # generation_config = GenerationConfig(
+        #    max_new_tokens=128,
+        #    forced_bos_token_id=(
+        #        language0_token_id if target_language == "0" else language1_token_id
+        #    ),
+        # )
+
+        # generation_output = model.generate(
+        #    encoder_outputs=BaseModelOutputWithPastAndCrossAttentions(
+        #        last_hidden_state=encoder_latents
+        #    ),
+        #    generation_config=generation_config,
+        # )
+
+        language_token_id = (
+            language0_token_id if target_language == "0" else language1_token_id
         )
 
-        generation_output = model.generate(
-            encoder_outputs=BaseModelOutputWithPastAndCrossAttentions(
-                last_hidden_state=encoder_latents
-            ),
-            generation_config=generation_config,
+        decoder_input_ids = torch.LongTensor([[bos_token_id, language_token_id]]).to(
+            device
+        )
+        generation_output = model.x_transformer.decoder.generate(
+            decoder_input_ids,
+            eos_token=eos_token_id,
+            seq_len=32,
+            context=encoder_latents,
+            context_mask=torch.ones_like(encoder_input_ids).bool(),
+            temperature=0.0,
         )
 
+        print("----")
+        print(generation_output)
+        print("----")
         generation_output = generation_output.cpu().numpy().tolist()[0]
+        print(encoder_input_ids)
+        print(decoder_input_ids)
         print(tokenizer.decode(generation_output, skip_special_tokens=False))
 
         # Decoder loss
@@ -933,5 +1174,5 @@ def main_eval():
 
 
 if __name__ == "__main__":
-    main_train()
-    # main_eval()
+    # main_train()
+    main_eval()
