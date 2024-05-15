@@ -70,19 +70,20 @@ def sample_matrix(
 def main():
     rng = np.random.default_rng(1234)
 
-    num_parallel_streams = 1024 * 64
-    num_prewarm_steps = 1024
-    num_sample_steps = 128
+    num_parallel_streams = 1024 * 1024
+    num_prewarm_steps = 128
+    num_sample_steps = 32
 
-    num_states = 64
-    num_outputs = 8
+    num_states = 4
+    num_outputs = 2
 
     import string
 
+    state_alphabet = string.ascii_uppercase
     output_alphabet = string.ascii_uppercase
 
-    transition_temperature = 2.0
-    output_temperature = 2.0
+    transition_temperature = 1.0
+    output_temperature = 100.0
 
     shared_transition_matrix = sample_matrix(
         num_states, temperature=transition_temperature, rng=rng
@@ -96,47 +97,60 @@ def main():
         num_states, num_outputs=num_outputs, temperature=output_temperature, rng=rng
     )
 
+    print(shared_transition_matrix)
+    print(lang1_output_matrix)
+    print(lang2_output_matrix)
+
     lang1_hmm = HiddenMarkovModel(shared_transition_matrix, lang1_output_matrix)
     lang2_hmm = HiddenMarkovModel(shared_transition_matrix, lang2_output_matrix)
 
     lang1_state = rng.integers(num_states, size=num_parallel_streams)
     lang2_state = rng.integers(num_states, size=num_parallel_streams)
 
-    lang1_trajectories = []
-    lang2_trajectories = []
+    lang1_state_trajectories = []
+    lang2_state_trajectories = []
+
+    lang1_output_trajectories = []
+    lang2_output_trajectories = []
 
     from tqdm.auto import trange
 
     for i in trange(num_prewarm_steps + num_sample_steps):
         if i >= num_prewarm_steps:
-            lang1_trajectories.append(lang1_hmm.sample_output(lang1_state, rng))
-            lang2_trajectories.append(lang2_hmm.sample_output(lang2_state, rng))
+            lang1_state_trajectories.append(lang1_state)
+            lang2_state_trajectories.append(lang2_state)
+
+            lang1_output_trajectories.append(lang1_hmm.sample_output(lang1_state, rng))
+            lang2_output_trajectories.append(lang2_hmm.sample_output(lang2_state, rng))
 
         lang1_state = lang1_hmm.next_state(lang1_state, rng)
         lang2_state = lang2_hmm.next_state(lang2_state, rng)
 
-    lang1_trajectories = np.stack(lang1_trajectories, axis=1)
-    lang2_trajectories = np.stack(lang2_trajectories, axis=1)
+    lang1_state_trajectories = np.stack(lang1_state_trajectories, axis=1)
+    lang2_state_trajectories = np.stack(lang2_state_trajectories, axis=1)
 
-    with open("data/lang1_hmm.txt", mode="w") as f:
-        f.write(
-            "\n".join(
-                [
-                    "".join([output_alphabet[symbol] for symbol in trajectory])
-                    for trajectory in lang1_trajectories
-                ]
-            )
+    lang1_output_trajectories = np.stack(lang1_output_trajectories, axis=1)
+    lang2_output_trajectories = np.stack(lang2_output_trajectories, axis=1)
+
+    def write_trajectories(trajectories: np.ndarray, alphabet: str):
+        return "\n".join(
+            [
+                "".join([alphabet[symbol] for symbol in trajectory])
+                for trajectory in trajectories
+            ]
         )
 
-    with open("data/lang2_hmm.txt", mode="w") as f:
-        f.write(
-            "\n".join(
-                [
-                    "".join([output_alphabet[symbol] for symbol in trajectory])
-                    for trajectory in lang2_trajectories
-                ]
-            )
-        )
+    with open("data/lang1_hmm_state.txt", mode="w") as f:
+        f.write(write_trajectories(lang1_state_trajectories, state_alphabet))
+
+    with open("data/lang2_hmm_state.txt", mode="w") as f:
+        f.write(write_trajectories(lang2_state_trajectories, state_alphabet))
+
+    with open("data/lang1_hmm_output.txt", mode="w") as f:
+        f.write(write_trajectories(lang1_output_trajectories, output_alphabet))
+
+    with open("data/lang2_hmm_output.txt", mode="w") as f:
+        f.write(write_trajectories(lang2_output_trajectories, output_alphabet))
 
 
 if __name__ == "__main__":
