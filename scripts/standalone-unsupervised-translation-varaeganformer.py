@@ -1116,12 +1116,26 @@ def main_eval():
 
     # Eval loop
     while True:
+        max_length = 32
         input_text = input("Input (str): ")
+        input_language = input("Input Language (Literal[0, 1]): ")
         target_language = input("Target Language (Literal[0, 1]): ")
+
+        input_language_token_id = (
+            language0_token_id if input_language == "0" else language1_token_id
+        )
+
+        target_language_token_id = (
+            language0_token_id if target_language == "0" else language1_token_id
+        )
 
         # Get latents
         encoding: tokenizers.Encoding = tokenizer.encode(input_text)
-        encoder_input_ids = [bos_token_id] + encoding.ids[:30] + [eos_token_id]
+        encoder_input_ids = (
+            [bos_token_id, input_language_token_id]
+            + encoding.ids[: max_length - 3]
+            + [eos_token_id]
+        )
         encoder_input_ids = torch.LongTensor([encoder_input_ids]).to(device)
 
         encoder_outputs: BaseModelOutputWithPastAndCrossAttentions = model.encoder(
@@ -1134,13 +1148,13 @@ def main_eval():
         # encoder_latents = encoder_latents_mean
 
         # Sample latents
-        latents = encoder_latents
-        latents_mean = model.mean_head(latents)
-        latents_log_var = model.log_var_head(latents)
+        # latents = encoder_latents
+        # latents_mean = model.mean_head(latents)
+        # latents_log_var = model.log_var_head(latents)
 
-        latents_noise = torch.randn_like(latents_mean)
-        latents = latents_mean + latents_noise * torch.exp(0.5 * latents_log_var)
-        encoder_latents = latents
+        # latents_noise = torch.randn_like(latents_mean)
+        # latents = latents_mean + latents_noise * torch.exp(0.5 * latents_log_var)
+        # encoder_latents = latents
 
         # Generate
         # generation_config = GenerationConfig(
@@ -1176,17 +1190,13 @@ def main_eval():
         #    generation_config=generation_config,
         # )
 
-        language_token_id = (
-            language0_token_id if target_language == "0" else language1_token_id
-        )
-
-        decoder_input_ids = torch.LongTensor([[bos_token_id, language_token_id]]).to(
-            device
-        )
+        decoder_input_ids = torch.LongTensor(
+            [[bos_token_id, target_language_token_id]]
+        ).to(device)
         generation_output = model.x_transformer.decoder.generate(
             decoder_input_ids,
             eos_token=eos_token_id,
-            seq_len=32,
+            seq_len=max_length,
             context=encoder_latents,
             context_mask=torch.ones_like(encoder_input_ids).bool(),
             temperature=0.0,
@@ -1202,9 +1212,11 @@ def main_eval():
 
         # Decoder loss
         decoder_input_ids = (
-            [bos_token_id, language_token_id] + encoding.ids[: 32 - 3] + [eos_token_id]
+            [bos_token_id, target_language_token_id]
+            + encoding.ids[: max_length - 3]
+            + [eos_token_id]
         )
-        decoder_labels = [-100] + encoding.ids[: 32 - 3] + [eos_token_id, -100]
+        decoder_labels = [-100] + encoding.ids[: max_length - 3] + [eos_token_id, -100]
 
         decoder_input_ids = torch.LongTensor([decoder_input_ids]).to(device)
         decoder_labels = torch.LongTensor([decoder_labels]).to(device)
