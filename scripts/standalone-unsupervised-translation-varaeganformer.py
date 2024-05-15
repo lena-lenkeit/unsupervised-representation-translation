@@ -364,10 +364,12 @@ def train_model(
         encoder_input_ids = token_ids
 
         ## Truncate
-        encoder_input_ids = encoder_input_ids[: max_length - 2]
+        encoder_input_ids = encoder_input_ids[: max_length - 3]
 
         ## Add special tokens
-        encoder_input_ids = [bos_token_id] + encoder_input_ids + [eos_token_id]
+        encoder_input_ids = (
+            [bos_token_id, label_token_id] + encoder_input_ids + [eos_token_id]
+        )
 
         ## Pad
         sequence_length = len(encoder_input_ids)
